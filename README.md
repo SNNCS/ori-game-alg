@@ -1,63 +1,204 @@
-# 原始三结构架构（最后通牒博弈）— 干净重实现
+# Original Three-Structure Game Cognition Architecture
 
-本目录是 `信号驱动的博弈认知架构 / 完整三结构_v5` 文档里**三结构**的干净重实现，
-**只面向最后通牒博弈**，不含任何电商（recommend / offer_discount / purchase /
-abandon）或 LLM prefix 注入逻辑。
+This repository implements a differentiable cognitive architecture for the
+Ultimatum Game. The system models how agents interpret an observed action,
+how relational asymmetry shapes that interpretation, and how possible future
+outcomes are reconstructed from the resulting intent representation.
 
-> 与 `E:\game_algorithm` 完全独立，没有改动那边任何代码。
+The implementation is intentionally compact: every major component is a
+PyTorch module, and the full loop can be optimized end to end with a single
+optimizer.
 
-## 三结构 ↔ 文件 ↔ 文档
+## Core Idea
 
-| # | 结构 | 文件 | 文档对应 |
-|---|------|------|----------|
-| ① | 人际关系图 **G** = (V,E,R) | [relation_graph.py](relation_graph.py) | v5 §一 `G ∈ R^(n×n×k)` |
-| ② | 未来结果树 **T** = (N,B,P) | [future_tree.py](future_tree.py) | v5 §三 `T_{t+1}=Reconstruct(Z)` |
-| ③ | 解释机制 **I**_j(a,S,G,H) | [interpretation.py](interpretation.py) | v5 §二 `Z ∈ R^(n×d)` |
+The architecture is built around three coupled structures:
 
-支撑件：[situation.py](situation.py)（ρ/h/ω/K 与 σ 组装）、[game_rule.py](game_rule.py)
-（最后通牒收益）、[agent.py](agent.py)（把三结构接成一个可优化模块）、
-[demo.py](demo.py)（端到端跑通 + 反向传播自检）。
+| Structure | Module | Role |
+|---|---|---|
+| `G` Relation Graph | [relation_graph.py](relation_graph.py) | Stores directed, asymmetric relation vectors between agents. |
+| `I` Interpretation Engine | [interpretation.py](interpretation.py) | Converts actions, relations, rule stance, and situation context into intent vectors. |
+| `T` Future Outcome Tree | [future_tree.py](future_tree.py) | Reconstructs possible future branches from the interpreted intent matrix. |
 
-## 保留的优化（按要求）
+The central representation is the intent matrix `Z in R^(n x d)`. Each row
+`z_j` is agent `j`'s interpretation of another agent's action, conditioned on
+its own relational edge, role, history, resources, public knowledge, and rule
+stance.
 
-1. **G 保留 PyTorch autograd**：`G` 是单个 `nn.Parameter`，clamp 在读取时进行
-   （不原地改写，不破坏计算图）。文档里那条手写慢层更新
-   `G[j,i,:] += 0.005·W_zᵀ(z*−z)` 被删除，改由 autograd + 单一优化器统一更新。
-2. **解释机制保留 r_j 与 σ**：
-   `z_j = tanh(W_z[ s ‖ edge ‖ r_j ‖ sigma_j ])`，`INPUT_DIM = 8+32+16+40 = 96`。
-3. **z 不切片**：没有任何代码把 `z[0:4]/z[4:12]/…` 当固定语义读。文档里
-   `dignity = z_B[4:12].mean()` 被换成 **可学习** 的 `BranchPolicy`（吃整条 z_B）。
-4. **T 重新实现并保持可优化**：分支概率是 torch 张量，梯度可从树的价值
-   （path_quality / optionality）回流到 `BranchPolicy`、解释引擎与关系图。
+## Architecture
 
-## 与文档最后通牒版的对应
+### 1. Relation Graph `G`
 
-- 动作 = 提议者保留份额 `BIDS=(0.5,…,0.9)`；响应 = `accept / reject / counter`。
-- 收益（[game_rule.py](game_rule.py)）：`accept` → A 得 `bid`、B 得 `1−bid`；
-  `reject` → 双方拿 outside option；`counter` → 蛋糕打折、继续。
-- 分支：`P(response | z_B, offer)` 由 `BranchPolicy` 学得（保留"越不公→越易拒"
-  这一结构先验，但其强度也是学的）。
-- 评估指标 `optionality / risk_floor / path_quality` 与路径依赖
-  `P(b|H) ∝ P(b)·exp(λ·consistency)` 均保留（`λ=0.3`）。
-- 损失 = 认知失调 `L=Σ_j KL(z_j‖z_j*)`，`z*` 由 `BayesianInverse(真实动作信号)`
-  给出——逆推真实**行动**而非话术，无 response_type 关键词分类器。
+`G` is a directed tensor of relation vectors:
 
-## 运行
+```text
+G[i, j, :] = agent i's relational view of agent j
+G[i, j, :] != G[j, i, :]
+```
+
+This asymmetry is treated as a first-class computational resource. The graph is
+stored as a single `nn.Parameter`, and edge values are clamped only at read time,
+so gradient flow remains intact.
+
+### 2. Interpretation Engine `I`
+
+For each observing agent `j`, the interpretation engine computes:
+
+```text
+z_j = tanh(W_z [s || G[j, i, :] || r_j || sigma_j])
+```
+
+where:
+
+- `s` is the encoded action signal.
+- `G[j, i, :]` is observer `j`'s relation edge toward actor `i`.
+- `r_j` is the observer's learnable rule interpretation.
+- `sigma_j` is the observer's situation vector.
+
+The situation vector is assembled as:
+
+```text
+sigma_j = [role_embedding || history_summary || resource_state || public_knowledge]
+```
+
+### 3. Future Outcome Tree `T`
+
+The future tree is generated from the current intent matrix `Z`. It expands
+candidate offers and possible responses:
+
+```text
+responses = accept / reject / counter
+```
+
+Branch probabilities are learned from the full responder intent vector `z_B`,
+not from fixed semantic slices. The tree evaluates:
+
+- `optionality`: normalized entropy over remaining leaf probability mass.
+- `risk_floor`: minimum reachable leaf quality.
+- `path_quality`: expected leaf quality.
+
+Path dependence is applied before evaluation:
+
+```text
+P(branch | H) proportional to P(branch) * exp(lambda * consistency(branch, H))
+```
+
+When a root branch is reweighted, all descendant joint probabilities are scaled
+accordingly, preserving coherent probability mass through counter branches.
+
+## Innovations
+
+### Differentiable Relational Asymmetry
+
+The directed relation graph is not a static feature table. It is part of the
+trainable computation graph. Gradients from interpretation loss and future-tree
+value flow back into `G`, allowing relational structure to adapt through the
+same optimizer as the rest of the model.
+
+### Intent Without Fixed Semantic Slicing
+
+The intent vector `z` is treated as a learned representation. Downstream modules
+consume the full vector instead of assigning hard-coded meanings to ranges such
+as `z[0:4]` or `z[4:12]`. This keeps the representation flexible and avoids
+baking undocumented semantics into the architecture.
+
+### Learned Branching Over Future Outcomes
+
+The future tree is generated dynamically from interpretation state. Its branch
+policy learns `P(response | z_B, offer)` from the responder's full intent vector,
+the offer, and a learned tolerance head. The resulting tree remains
+differentiable, so expected future value can train interpretation and relation
+parameters.
+
+### Action-Based Cognitive Dissonance
+
+The model defines cognitive dissonance as a divergence between the current
+intent representation and an action-conditioned inverse estimate:
+
+```text
+L = sum_j KL(z_j || z_j*)
+z_j* = BayesianInverse(s, z_j)
+```
+
+The correction target is derived from the actual action signal, keeping the loss
+grounded in observed behavior.
+
+### Stateful Situation Encoding
+
+Each agent carries a mutable history summary `h_j`, updated after observed
+responses. This lets future interpretations depend on prior interaction
+patterns while keeping the trainable model compact.
+
+## End-to-End Flow
+
+1. A proposer action is encoded as signal `s`.
+2. Each observer interprets the action through its own relation edge and
+   situation state.
+3. The interpretation engine produces the intent matrix `Z`.
+4. The responder's intent drives a generated future outcome tree.
+5. Path dependence adjusts branch probabilities from recent history.
+6. Tree metrics produce differentiable value signals.
+7. Cognitive dissonance and rule regularization are combined with tree value.
+8. A single optimizer updates the relation graph, interpretation engine, rule
+   stances, tolerance head, and branch policy.
+
+## File Map
+
+| File | Purpose |
+|---|---|
+| [config.py](config.py) | Dimensions, game constants, and training hyperparameters. |
+| [relation_graph.py](relation_graph.py) | Directed trainable relation graph `G`. |
+| [interpretation.py](interpretation.py) | Signal construction, interpretation engine, inverse model, tolerance head. |
+| [future_tree.py](future_tree.py) | Differentiable future-tree generation, path dependence, and evaluation. |
+| [situation.py](situation.py) | Role embeddings, history summaries, resources, and public knowledge. |
+| [game_rule.py](game_rule.py) | Ultimatum Game payoff and legality rules. |
+| [agent.py](agent.py) | Composition layer that wires all structures into one trainable module. |
+| [demo.py](demo.py) | End-to-end smoke test and gradient-flow verification. |
+
+## Run
 
 ```bash
 cd E:\game_algorithm_ori
 python demo.py
 ```
 
-预期输出确认 G / I / T 三者都拿到梯度，且 `G[A,B]` 与 `G[B,A]` 的不对称性非零
-（文档所说的"博弈核心资源"）。
+The demo performs a short optimization loop and verifies that gradients flow
+through all three core structures:
 
-## 维度速查
-
+```text
+G  RelationGraph
+I  InterpretationEngine
+T  FutureTreeGen.policy
 ```
-N_AGENTS=3 (A提议者0 / B响应者1 / C旁观者2)
-K=32 边向量   D=32 意图向量   P=16 规则解释 r_j
-σ = ρ(8)+h(16)+ω(8)+K(8) = 40
-s = [bid, 1-bid, fairness] + context(5) = 8
-INPUT_DIM = s(8)+edge(32)+r_j(16)+σ(40) = 96
+
+## Dimensional Reference
+
+```text
+N_AGENTS = 3   A: proposer, B: responder, C: observer
+K = 32         relation-edge vector dimension
+D = 32         intent vector dimension
+P = 16         rule-interpretation dimension
+
+sigma = role(8) + history(16) + resource(8) + public_knowledge(8) = 40
+s     = [bid, 1 - bid, fairness_deviation] + context(5) = 8
+
+INPUT_DIM = s(8) + edge(32) + r_j(16) + sigma(40) = 96
+```
+
+## Minimal Example
+
+```python
+import torch
+
+import config
+from agent import CognitiveAgent
+from interpretation import build_context
+
+torch.manual_seed(config.SEED)
+
+agent = CognitiveAgent()
+context = build_context(turn_idx=0, session_len=8)
+out = agent.interpret_and_plan(0.6, context=context, history=[])
+
+print(out["Z"].shape)
+print(out["metrics"])
 ```
