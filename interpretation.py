@@ -50,10 +50,16 @@ def build_signal(bid, context=None):
     """
     if context is None:
         context = build_context()
-    bid = float(bid)
-    head = torch.tensor([bid, 1.0 - bid, 2.0 * abs(bid - 0.5)],
-                        dtype=torch.float32)
-    return torch.cat([head, context.to(torch.float32)], dim=-1)
+    context = torch.as_tensor(context, dtype=torch.float32)
+    bid = torch.as_tensor(bid, dtype=context.dtype, device=context.device)
+    bid = bid.reshape(())
+    head = torch.stack([
+        bid,
+        1.0 - bid,
+        2.0 * torch.abs(bid - 0.5),
+    ])
+    return torch.cat([head, context.to(dtype=head.dtype, device=head.device)],
+                     dim=-1)
 
 
 # ---------------------------------------------------------------------------

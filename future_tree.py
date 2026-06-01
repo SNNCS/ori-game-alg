@@ -30,6 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import config
+from game_adapter import UltimatumGameAdapter
 
 
 # ---------------------------------------------------------------------------
@@ -37,8 +38,7 @@ import config
 # ---------------------------------------------------------------------------
 
 class BranchPolicy(nn.Module):
-    """Maps the responder's intent vector + offer fairness to a distribution
-    over (accept, reject, counter).
+    """Maps counterpart intent + intervention context to response probabilities.
 
     Replaces the v5 hard-coded `dignity = z_B[4:12].mean()` rule. The whole
     z_B is consumed by W_resp; the scalar (action-0.5) fairness gap is the
@@ -46,22 +46,27 @@ class BranchPolicy(nn.Module):
     and even its effect is learned through w_action.
     """
 
-    def __init__(self, d=config.D, use_tolerance=True):
+    def __init__(self, d=config.D, n_responses=3,
+                 signal_dim=config.SIGNAL_DIM, use_tolerance=True):
         super().__init__()
         self.use_tolerance = use_tolerance
-        self.W_resp = nn.Linear(d, 3, bias=True)        # intent -> response logits
-        self.w_action = nn.Linear(1, 3, bias=False)     # fairness-gap modulation
+        self.n_responses = int(n_responses)
+        self.W_resp = nn.Linear(d, self.n_responses, bias=True)
+        self.w_action = nn.Linear(1, self.n_responses, bias=False)
+        self.w_signal = nn.Linear(signal_dim, self.n_responses, bias=False)
         if use_tolerance:
-            self.w_tol = nn.Linear(1, 3, bias=False)    # tolerance modulation
+            self.w_tol = nn.Linear(1, self.n_responses, bias=False)
 
-    def forward(self, z_B, action, tolerance=None):
-        gap = torch.tensor([float(action) - 0.5],
-                           device=z_B.device, dtype=z_B.dtype)
+    def forward(self, z_B, action, tolerance=None, comm_signal=None):
+        action_t = torch.as_tensor(action, device=z_B.device, dtype=z_B.dtype)
+        gap = action_t.reshape(1) - 0.5
         logits = self.W_resp(z_B) + self.w_action(gap)
+        if comm_signal is not None:
+            logits = logits + self.w_signal(comm_signal.to(z_B.dtype))
         if self.use_tolerance and tolerance is not None:
             tol = tolerance.reshape(1).to(z_B.dtype)
             logits = logits + self.w_tol(tol)
-        return F.softmax(logits, dim=-1)                # (3,) accept/reject/counter
+        return F.softmax(logits, dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -84,87 +89,110 @@ class Node:
 # ---------------------------------------------------------------------------
 
 class FutureTreeGen(nn.Module):
-    BIDS = config.BIDS
-    RESPONSES = config.RESPONSES
-
-    def __init__(self, rule, d=config.D, tolerance_head=None):
+    def __init__(self, rule, adapter=None, d=config.D, tolerance_head=None,
+                 signal_dim=config.SIGNAL_DIM):
         super().__init__()
         self.rule = rule
+        self.adapter = adapter if adapter is not None else UltimatumGameAdapter(rule)
         self.d = d
         self.tolerance_head = tolerance_head      # optional ToleranceHead
-        self.policy = BranchPolicy(d=d, use_tolerance=tolerance_head is not None)
+        self.policy = BranchPolicy(
+            d=d, n_responses=len(self.adapter.response_labels()),
+            signal_dim=signal_dim,
+            use_tolerance=tolerance_head is not None)
+
+    @property
+    def BIDS(self):
+        return self.adapter.candidate_interventions()
+
+    @property
+    def RESPONSES(self):
+        return self.adapter.response_labels()
 
     # ----- branch probabilities (driven by Z) ------------------------------
 
-    def _branch_probs(self, z_B, action):
+    def _branch_probs(self, z_B, action, comm_signal=None):
         tol = None
         if self.tolerance_head is not None:
             tol = self.tolerance_head(z_B)
-        return self.policy(z_B, action, tolerance=tol)
+        return self.policy(
+            z_B, action, tolerance=tol, comm_signal=comm_signal)
 
     # ----- transition ------------------------------------------------------
 
     def transition(self, state, action, response):
-        new = dict(state)
-        pie = state["pie"]
-        if response == "accept":
-            new["payoff_A"] = state["payoff_A"] + self.rule.compute_payoff(
-                action, "accept", config.ACTOR_A, pie)
-            new["payoff_B"] = state["payoff_B"] + self.rule.compute_payoff(
-                action, "accept", config.ACTOR_B, pie)
-            new["paths_open"] = 0.0                      # deal closed
-        elif response == "reject":
-            new["payoff_A"] = state["payoff_A"] + self.rule.outside
-            new["payoff_B"] = state["payoff_B"] + self.rule.outside
-            new["paths_open"] = 0.0                      # game over (spite)
-        else:                                            # counter -> continue
-            new["pie"] = pie * config.COUNTER_DISCOUNT   # the stake shrinks
-            new["paths_open"] = max(0.0, state["paths_open"] - config.PATHS_OPEN_DECAY)
-        return new
+        return self.adapter.transition(state, action, response)
 
     # ----- intent drift across depth --------------------------------------
 
-    @staticmethod
-    def update_Z(Z, response):
+    def update_Z(self, Z, response):
         """Small whole-row perturbation of the responder's intent across a
         continue branch (v5 update_Z). No slicing -- the entire z_B row drifts.
         """
         Z2 = Z.clone()
-        shift = 0.05 if response == "reject" else (-0.05 if response == "accept" else 0.0)
-        Z2[config.ACTOR_B, :] = torch.tanh(Z2[config.ACTOR_B, :] + shift)
+        shift = self.adapter.intent_shift_for_response(response)
+        row = self.adapter.counterpart_actor
+        Z2[row, :] = torch.tanh(Z2[row, :] + shift)
         return Z2
 
     # ----- tree construction ----------------------------------------------
 
+    def _initial_state(self, sigma_root=None):
+        return self.adapter.initial_tree_state(sigma_root)
+
     def generate(self, Z, sigma_root=None, depth=config.DEPTH):
-        root_state = {"payoff_A": 0.0, "payoff_B": 0.0,
-                      "pie": 1.0, "paths_open": 1.0, "sigma": sigma_root}
+        root_state = self._initial_state(sigma_root)
         return self._build(Z, root_state, depth, path_prob=None)
+
+    def simulate_action(self, Z, action, sigma_root=None, depth=config.DEPTH,
+                        comm_signal=None):
+        """Build T(action): a future tree conditioned on one intervention.
+
+        `generate` keeps the legacy "enumerate all bids under the root" shape.
+        This method is the planner primitive needed by a decision engine:
+        it answers "if I do this action now, what futures are possible?"
+        """
+        root_state = self._initial_state(sigma_root)
+        return self._build_action(
+            Z, root_state, action, depth, path_prob=None,
+            comm_signal=comm_signal)
+
+    def _build_action(self, Z, state, action, depth, path_prob,
+                      comm_signal=None):
+        root = Node(state, prob=path_prob)
+        z_B = Z[self.adapter.counterpart_actor]
+        probs = self._branch_probs(z_B, action, comm_signal=comm_signal)
+        for ri, resp in enumerate(self.RESPONSES):
+            p = probs[ri]
+            joint = p if path_prob is None else path_prob * p
+            new_state = self.transition(state, action, resp)
+            child = Node(new_state, action=action, response=resp, prob=joint)
+            root.children.append(child)
+            if depth > 1 and self.adapter.is_continue_response(resp):
+                new_Z = self.update_Z(Z, resp)
+                sub = self._build(new_Z, new_state, depth - 1, joint)
+                child.children = sub.children
+        return root
 
     def _build(self, Z, state, depth, path_prob):
         root = Node(state, prob=path_prob)
-        z_B = Z[config.ACTOR_B]
+        z_B = Z[self.adapter.counterpart_actor]
         n_bids = len(self.BIDS)
         for bid in self.BIDS:
-            probs = self._branch_probs(z_B, bid)          # (3,)
+            probs = self._branch_probs(z_B, bid)
             for ri, resp in enumerate(self.RESPONSES):
                 p = probs[ri] / n_bids                     # uniform prior over bids
                 joint = p if path_prob is None else path_prob * p
                 new_state = self.transition(state, bid, resp)
                 child = Node(new_state, action=bid, response=resp, prob=joint)
                 root.children.append(child)
-                if depth > 1 and resp == "counter":
+                if depth > 1 and self.adapter.is_continue_response(resp):
                     new_Z = self.update_Z(Z, resp)
                     sub = self._build(new_Z, new_state, depth - 1, joint)
                     child.children = sub.children
         return root
 
     # ----- evaluation ------------------------------------------------------
-
-    @staticmethod
-    def _quality(state, role=config.ACTOR_A):
-        payoff = state["payoff_A"] if role == config.ACTOR_A else state["payoff_B"]
-        return payoff + 0.2 * state["paths_open"]
 
     def _collect_leaves(self, node, leaves):
         if not node.children:
@@ -173,15 +201,18 @@ class FutureTreeGen(nn.Module):
         for c in node.children:
             self._collect_leaves(c, leaves)
 
-    def evaluate(self, root, role=config.ACTOR_A):
+    def evaluate(self, root, role=None):
         """Returns a dict of torch scalars (differentiable w.r.t. the policy,
         interpretation engine, and relation graph through the leaf probs).
         """
+        if role is None:
+            role = self.adapter.focal_actor
         leaves = []
         self._collect_leaves(root, leaves)
         P = torch.stack([leaf.prob for leaf in leaves])
         P = P / (P.sum() + 1e-8)
-        Q = torch.tensor([self._quality(leaf.state, role) for leaf in leaves],
+        Q = torch.tensor([self.adapter.outcome_quality(leaf.state, role)
+                          for leaf in leaves],
                          dtype=P.dtype, device=P.device)
         H = -(P * torch.log(P + 1e-12)).sum()
         H_max = torch.log(torch.tensor(float(max(len(P), 1)),
@@ -210,7 +241,8 @@ class FutureTreeGen(nn.Module):
         if not history:
             return root
         recent = history[-10:]
-        outs = [h.get("response", "counter") for h in recent]
+        fallback = self.RESPONSES[-1]
+        outs = [h.get("response", fallback) for h in recent]
         n = max(len(outs), 1)
         rate = {r: outs.count(r) / n for r in self.RESPONSES}
 

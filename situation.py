@@ -8,8 +8,8 @@ alongside the signal, edge, and rule blocks:
     omega resource state             (OMEGA_DIM)   omega[0] = physical payoff
     K     public-knowledge vector     (K_DIM)
 
-Nothing here is e-commerce specific; the history one-hot uses the ultimatum
-response triple (accept / reject / counter).
+History response categories are provided by the domain adapter, so this module
+does not need to know the concrete response labels.
 """
 
 import numpy as np
@@ -34,22 +34,28 @@ class RoleEmbedding(nn.Module):
 class HistorySummarizer(nn.Module):
     """h_j <- gamma * h_j + (1 - gamma) * tanh(W_enc[s || resp_onehot || z_j]).
 
-    resp_onehot is over (accept, reject, counter).
+    resp_onehot is over adapter-provided observable response labels.
     """
 
     HIST_SIGNAL_DIM = config.M
 
-    def __init__(self, dim=config.H_DIM, d=config.D):
+    def __init__(self, dim=config.H_DIM, d=config.D, response_labels=None):
         super().__init__()
         self.dim = dim
         self.d = d
-        input_dim = self.HIST_SIGNAL_DIM + 3 + d
+        self.response_labels = tuple(
+            response_labels if response_labels is not None
+            else ("observed",))
+        input_dim = self.HIST_SIGNAL_DIM + len(self.response_labels) + d
         self.W_enc = nn.Linear(input_dim, dim, bias=True)
 
-    @staticmethod
-    def response_onehot(response, device=None, dtype=torch.float32):
-        idx = {"accept": 0, "reject": 1, "counter": 2}.get(response, 2)
-        v = torch.zeros(3, device=device, dtype=dtype)
+    def response_onehot(self, response, device=None, dtype=torch.float32):
+        fallback = max(len(self.response_labels) - 1, 0)
+        try:
+            idx = self.response_labels.index(response)
+        except ValueError:
+            idx = fallback
+        v = torch.zeros(len(self.response_labels), device=device, dtype=dtype)
         v[idx] = 1.0
         return v
 

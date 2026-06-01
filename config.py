@@ -40,6 +40,13 @@ SIGMA_DIM = RHO_DIM + H_DIM + OMEGA_DIM + K_DIM   # 40
 N_CONTEXT = 5       # turn_pos, session_len, prev_reject_rate, status_gap, urgency
 M = 3 + N_CONTEXT   # [bid, complement, fairness_dev] + context = 8
 
+# --- Learnable outgoing communicative signal ---
+# This is separate from the observed physical-action encoding `s`. It has no
+# fixed semantic labels; its meaning is learned through how it changes predicted
+# and observed responses.
+SIGNAL_DIM = 8
+SIGNAL_INPUT_DIM = M + D + SIGMA_DIM
+
 # Interpretation input width: [ s || edge || r_j || sigma_j ]
 INPUT_DIM = M + K + P + SIGMA_DIM                 # 8 + 32 + 16 + 40 = 96
 
@@ -49,6 +56,15 @@ RESPONSES = ("accept", "reject", "counter")
 OUTSIDE_OPTION = 0.0                     # payoff when the offer is rejected
 COUNTER_DISCOUNT = 0.9                   # pie shrinks each time B counters
 PATHS_OPEN_DECAY = 0.1                   # optionality lost per continue
+
+# --- Learnable latent action generation ---
+# Actions are generated as latent vectors, then decoded by the domain adapter
+# into executable interventions. The current ultimatum adapter decodes the
+# first latent coordinate into a continuous kept-share bid.
+ACTION_LATENT_DIM = 16
+N_GENERATED_ACTIONS = len(BIDS)
+ACTION_CONTEXT_DIM = SIGMA_DIM * 2 + K + N_CONTEXT
+ACTION_HIDDEN_DIM = 64
 
 # --- Tree / dynamics ---
 DEPTH   = 2        # future-tree depth
@@ -68,6 +84,8 @@ SEED = 0
 def sanity_check():
     assert SIGMA_DIM == 40, SIGMA_DIM
     assert M == 8, M
+    assert SIGNAL_INPUT_DIM == 80, SIGNAL_INPUT_DIM
+    assert ACTION_CONTEXT_DIM == 117, ACTION_CONTEXT_DIM
     assert INPUT_DIM == 96, INPUT_DIM
 
 

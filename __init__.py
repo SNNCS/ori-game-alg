@@ -17,7 +17,23 @@ from situation import (
     init_knowledge, build_sigma,
 )
 from game_rule import UltimatumRule
+from game_adapter import EntitySet, UltimatumGameAdapter
 from future_tree import FutureTreeGen, BranchPolicy, Node
+from signal_model import OutgoingSignal, SignalGenerator
+from action_model import GeneratedInterventions, CandidateInterventionGenerator
+from decision import (
+    CandidateIntervention, PredictedFuture, DecisionResult,
+    FuturePositionEvaluator, DecisionEngine,
+)
+from experience import (
+    Outcome, RealizedUtility, LearningSignal, ExperienceStep,
+    OutcomeFeatureEncoder, OutcomeUtilityEvaluator,
+    resolve_ultimatum_outcome, build_learning_signal,
+)
+from evaluation import (
+    AblationSpec, UsefulnessReport, NO_UNDERSTANDING, NO_SIGNAL,
+    compare_decisions,
+)
 from agent import CognitiveAgent
 
 __all__ = [
@@ -27,6 +43,16 @@ __all__ = [
     "RoleEmbedding", "HistorySummarizer", "init_resource", "update_resource",
     "init_knowledge", "build_sigma",
     "UltimatumRule",
+    "EntitySet", "UltimatumGameAdapter",
     "FutureTreeGen", "BranchPolicy", "Node",
+    "OutgoingSignal", "SignalGenerator",
+    "GeneratedInterventions", "CandidateInterventionGenerator",
+    "CandidateIntervention", "PredictedFuture", "DecisionResult",
+    "FuturePositionEvaluator", "DecisionEngine",
+    "Outcome", "RealizedUtility", "LearningSignal", "ExperienceStep",
+    "OutcomeFeatureEncoder", "OutcomeUtilityEvaluator",
+    "resolve_ultimatum_outcome", "build_learning_signal",
+    "AblationSpec", "UsefulnessReport", "NO_UNDERSTANDING", "NO_SIGNAL",
+    "compare_decisions",
     "CognitiveAgent",
 ]
