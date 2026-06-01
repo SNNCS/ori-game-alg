@@ -51,6 +51,8 @@ def build_signal(bid, context=None):
     if context is None:
         context = build_context()
     context = torch.as_tensor(context, dtype=torch.float32)
+    if hasattr(bid, "primary_value"):
+        bid = bid.primary_value
     bid = torch.as_tensor(bid, dtype=context.dtype, device=context.device)
     bid = bid.reshape(())
     head = torch.stack([
@@ -69,10 +71,12 @@ def build_signal(bid, context=None):
 class InterpretationEngine(nn.Module):
     """z_j = tanh(W_z [s || edge || r_j || sigma_j])."""
 
-    def __init__(self, d=config.D, input_dim=config.INPUT_DIM):
+    def __init__(self, d=config.D, input_dim=config.INPUT_DIM,
+                 signal_dim=config.M):
         super().__init__()
         self.d = d
         self.input_dim = input_dim
+        self.signal_dim = signal_dim
         self.W_z = nn.Linear(input_dim, d, bias=True)
 
     def infer_intent(self, s, edge, r_j, sigma_j):
@@ -105,7 +109,7 @@ class InterpretationEngine(nn.Module):
         sigma_C are kept so the propagated read still carries C's rule stance
         and situation.
         """
-        prop_signal = z_B[:config.M]
+        prop_signal = z_B[:self.signal_dim]
         edge_CB = G.get_edge(target_C, source_B)
         return self.infer_intent(prop_signal, edge_CB, r_C, sigma_C)
 

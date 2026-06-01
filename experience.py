@@ -26,7 +26,7 @@ import config
 class Outcome:
     """Raw observed result after an intervention."""
 
-    action: float
+    action: Any
     response: str
     pie_after: float
     paths_open: float

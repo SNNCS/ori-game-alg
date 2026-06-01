@@ -34,7 +34,7 @@ class AdapterAndDecisionContractTests(unittest.TestCase):
             self.assertEqual(candidate.metadata["source"], "generated")
             self.assertIsNotNone(candidate.latent_action)
             self.assertTrue(candidate.latent_action.requires_grad)
-            action_value = float(torch.as_tensor(candidate.action).detach())
+            action_value = float(candidate.action)
             self.assertGreaterEqual(action_value, affordance.low)
             self.assertLessEqual(action_value, affordance.high)
             self.assertTrue(agent.adapter.validate_intervention(candidate.action))

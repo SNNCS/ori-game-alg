@@ -65,6 +65,8 @@ class CandidateInterventionGenerator(nn.Module):
 
     def forward(self, actor_sigma, counterpart_sigma, relation_edge, context,
                 adapter, n_candidates=None):
+        if n_candidates is None and hasattr(adapter, "action_affordance"):
+            n_candidates = adapter.action_affordance().n_candidates
         n = int(n_candidates or self.n_candidates)
         if n < 1 or n > self.n_candidates:
             raise ValueError(

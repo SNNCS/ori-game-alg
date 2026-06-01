@@ -38,7 +38,8 @@ class UltimatumRule:
 
     def compute_payoff(self, action, response, role_id, pie=1.0):
         """action = proposer's kept share in [0,1]; pie = current stake."""
-        action = float(torch.as_tensor(action).detach().cpu())
+        action = float(action) if hasattr(action, "__float__") else float(
+            torch.as_tensor(action).detach().cpu())
         pie = float(torch.as_tensor(pie).detach().cpu())
         if response == "accept":
             keep = pie * action

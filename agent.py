@@ -24,7 +24,7 @@ import config
 from relation_graph import RelationGraph
 from interpretation import (
     InterpretationEngine, RuleInterpretation, BayesianInverse, ToleranceHead,
-    build_signal, build_context, dissonance_loss,
+    build_context, dissonance_loss,
 )
 from situation import (
     RoleEmbedding, HistorySummarizer, init_resource, update_resource,
@@ -58,13 +58,20 @@ class CognitiveAgent(nn.Module):
         self.n = (
             int(n_agents) if n_agents is not None
             else self.adapter.entities.n_entities)
+        self.action_signal_dim = int(getattr(
+            self.adapter, "action_signal_dim", config.M))
+        self.interp_input_dim = (
+            self.action_signal_dim + config.K + config.P + config.SIGMA_DIM)
 
         # structure ①
         self.G = RelationGraph(n_agents=self.n)
 
         # structure ③ + heads
-        self.interp = InterpretationEngine()
-        self.bayes = BayesianInverse()
+        self.interp = InterpretationEngine(
+            input_dim=self.interp_input_dim,
+            signal_dim=self.action_signal_dim,
+        )
+        self.bayes = BayesianInverse(m=self.action_signal_dim)
         self.tolerance = ToleranceHead()
         self.rules = nn.ModuleList([
             RuleInterpretation(init_r=self.rule.r_public) for _ in range(self.n)
@@ -73,13 +80,15 @@ class CognitiveAgent(nn.Module):
         # situation
         self.roles = RoleEmbedding(n_roles=self.n)
         self.history = HistorySummarizer(
-            response_labels=self.adapter.response_labels())
+            response_labels=self.adapter.response_labels(),
+            signal_dim=self.action_signal_dim)
 
         # structure ②  (shares the tolerance head so the tree reads B's z too)
         self.tree = FutureTreeGen(
             self.rule, adapter=self.adapter, tolerance_head=self.tolerance)
         self.action_gen = CandidateInterventionGenerator()
-        self.signal_gen = SignalGenerator()
+        self.signal_gen = SignalGenerator(
+            input_dim=self.action_signal_dim + config.D + config.SIGMA_DIM)
         self.utility = FuturePositionEvaluator()
         self.outcome_utility = OutcomeUtilityEvaluator(adapter=self.adapter)
         self.decision = DecisionEngine()
@@ -120,7 +129,7 @@ class CognitiveAgent(nn.Module):
         """
         if actor_i is None:
             actor_i = self.adapter.focal_actor
-        s = build_signal(bid, context)
+        s = self.adapter.encode_action_signal(bid, context)
         r_dict = {j: self.r_of(j) for j in range(self.n)}
         sigma_dict = {j: self.sigma_of(j) for j in range(self.n)}
 
@@ -183,6 +192,7 @@ class CognitiveAgent(nn.Module):
             relation_edge=relation_edge,
             context=context,
             adapter=self.adapter,
+            n_candidates=self.adapter.action_affordance().n_candidates,
         )
         return generated
 

@@ -17,10 +17,11 @@ interventions. It also has `experience.py`, `Outcome`,
 realized utility, and prediction/value/policy losses are distinct in code.
 `signal_model.py` now adds learned outgoing communicative signals, and
 `FutureTreeGen` conditions response prediction on those signals.
-`game_adapter.py` now owns the current toy game's entities, action affordance
-boundary, latent-action decoding, response labels, transitions, initial public
-knowledge, and outcome feature names; the core agent consumes these through the
-adapter. The broader closed loop is not complete yet: richer experience-driven
+`game_spec.py` and `generic_adapter.py` now provide the preferred scenario
+extension path: games are declared as Python dataclass specs, then interpreted
+by `GenericGameAdapter`. The repo includes six built-in specs: Ultimatum,
+Prisoner's Dilemma, Chicken, Stag Hunt, Public Goods, and First-price Auction.
+The broader closed loop is not complete yet: richer experience-driven
 value/preference learning, richer multi-dimensional action grounding, and
 stronger multi-scenario tests for understanding-as-action improvement still
 need to be added.
@@ -144,10 +145,9 @@ It must not:
 - Encode fixed psychological meanings.
 - Convert outcomes directly into utility.
 
-For the current repo, `UltimatumGameAdapter` is this boundary. `UltimatumRule`
-still supplies payoff legality, while the adapter exposes entities,
-action affordances, action decoding, response labels, transitions, initial
-resources, public knowledge, raw outcomes, and utility features.
+For the current repo, `GameSpec` plus `GenericGameAdapter` is this boundary.
+`UltimatumGameAdapter` remains only as a backward-compatible wrapper around the
+Ultimatum spec.
 
 ### 2. Belief Model
 
@@ -299,8 +299,8 @@ Current mapping:
 - The original `demo.py` handwrote bids with `bid = 0.6 + 0.05 * step`.
 - `CandidateInterventionGenerator` now creates latent action vectors from
   actor situation, counterpart situation, relation edge, and context.
-- `UltimatumGameAdapter.decode_action` grounds those vectors into executable
-  kept-share bids.
+- `GenericGameAdapter.decode_action` grounds those vectors into executable
+  controls declared by the active `GameSpec`.
 - The current demo now calls `CognitiveAgent.deliberate`, which scores
   generated candidate futures and selects a bid/signal intervention.
 - `CognitiveAgent.act`, `CognitiveAgent.observe`, and `CognitiveAgent.learn`
@@ -515,20 +515,20 @@ removing understanding changes expected position and policy scores. Stronger
 future work should compare realized future position over multiple environments
 or opponent policies.
 
-### Step 7: Move domain discreteness behind adapters
+### Step 7: Move domain discreteness behind specs/adapters
 
-Status: implemented as an initial adapter boundary.
+Status: implemented as a generic spec/adapter boundary.
 
-`UltimatumGameAdapter` now owns the current game's concrete entity roles,
-action affordance boundary, latent-action decoding into kept-share bids,
-response labels, continue-branch semantics, initial resources, initial public
-knowledge, state transitions, raw outcome resolution, and outcome utility
-features. Core modules such as `CognitiveAgent`,
-`HistorySummarizer`, `BranchPolicy`, `FutureTreeGen`, and
-`OutcomeUtilityEvaluator` derive their sizes and labels from the adapter.
+`GameSpec` now owns concrete entity roles, action controls, response labels,
+continue-branch semantics, initial public knowledge, state transitions, raw
+outcome resolution effects, and outcome utility features. `GenericGameAdapter`
+interprets these specs and exposes the stable contract consumed by core modules
+such as `CognitiveAgent`, `HistorySummarizer`, `BranchPolicy`,
+`FutureTreeGen`, and `OutcomeUtilityEvaluator`.
 
 This solves the immediate hardcoding problem for roles/responses/features and
-moves action grounding behind affordances rather than fixed core action lists.
+moves action grounding behind declarative affordances rather than fixed core
+action lists.
 
 ### Step 8: Generate latent actions before grounding
 

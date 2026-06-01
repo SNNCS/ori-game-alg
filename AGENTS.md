@@ -1,9 +1,10 @@
 # AGENTS.md
 
 This repository is a compact PyTorch implementation of an original
-three-structure cognitive architecture for the Ultimatum Game. Use this file as
-the first orientation point for future agents. The README contains a concise
-user-facing overview; this document is the working map for making safe changes.
+three-structure cognitive architecture for declarative game environments. Use
+this file as the first orientation point for future agents. The README contains
+a concise user-facing overview; this document is the working map for making
+safe changes.
 
 ## Suggested Skills
 
@@ -18,9 +19,10 @@ user-facing overview; this document is the working map for making safe changes.
 
 ## Project Purpose
 
-The project models how agents interpret an observed ultimatum-game action, how
-directed relational asymmetry changes that interpretation, and how possible
-future outcomes are reconstructed from the resulting intent representation.
+The project models how agents generate actions, interpret interventions, use
+directed relational asymmetry, and reconstruct possible future outcomes from
+the resulting intent representation. Concrete games are declared as `GameSpec`
+objects and interpreted by `GenericGameAdapter`.
 
 The core architecture is:
 
@@ -65,12 +67,15 @@ autograd.
 | File | Responsibility |
 | --- | --- |
 | `config.py` | Global constants, dimensions, hyperparameters, and sanity checks. |
-| `game_rule.py` | Ultimatum Game payoff and legality rules. |
+| `game_spec.py` | Declarative game schema, expression DSL, transition effects, and grounded actions. |
+| `generic_adapter.py` | Generic `GameSpec` interpreter exposing the adapter contract. |
+| `game_rule.py` | Backward-compatible Ultimatum rule facade. |
 | `relation_graph.py` | Structure `G`: trainable directed relation tensor. |
 | `situation.py` | Role embeddings, history summaries, resource state, public knowledge, and `sigma` assembly. |
 | `interpretation.py` | Structure `I`: signal construction, intent inference, propagation, rule stance, Bayesian inverse, tolerance head, dissonance loss. |
-| `game_adapter.py` | Domain adapter for concrete roles/entities, action affordances/decoding, response labels, transitions, outcomes, and utility features. |
+| `game_adapter.py` | Backward-compatible `UltimatumGameAdapter` wrapper over `GenericGameAdapter`. |
 | `action_model.py` | Learnable latent action generation before adapter grounding. |
+| `specs/` | Built-in benchmark specs: Ultimatum, Prisoner's Dilemma, Chicken, Stag Hunt, Public Goods, First-price Auction. |
 | `future_tree.py` | Structure `T`: branch policy, recursive future tree, path dependence, and evaluation metrics. |
 | `signal_model.py` | Learnable outgoing communicative signal generation. |
 | `decision.py` | Candidate interventions, predicted futures, future-position scoring, and action selection. |
@@ -85,18 +90,13 @@ autograd.
 
 ## Core Domain Vocabulary
 
-- **Focal actor / proposer in the current adapter**:
-  `UltimatumGameAdapter.focal_actor`, backed by `config.ACTOR_A == 0`.
-  Makes an offer and keeps the `bid` share of the pie.
-- **Counterpart / responder in the current adapter**:
-  `UltimatumGameAdapter.counterpart_actor`, backed by `config.ACTOR_B == 1`.
-  Responds with adapter-provided labels such as `accept`, `reject`, or
-  `counter`.
-- **Observer in the current adapter**:
-  `UltimatumGameAdapter.observer_actor`, backed by `config.ACTOR_C == 2`.
-  Receives propagated interpretation from the counterpart.
-- **Signal `s`**: deterministic action encoding from `build_signal`.
-  Shape is `M=8`: `[bid, 1-bid, fairness_dev] + context(5)`.
+- **Focal / counterpart / observer**: role bindings declared by each
+  `GameSpec` and exposed through the adapter.
+- **Grounded action**: adapter-decoded `GroundedAction` containing typed
+  controls, `primary_value`, display text, and metadata.
+- **Signal `s`**: adapter-provided deterministic action encoding from
+  `encode_action_signal`. Default shape is `M=8`: three action features plus
+  context(5).
 - **Relation edge `G[j,i,:]`**: observer `j`'s directed relational view of actor
   `i`, shape `K=32`.
 - **Rule stance `r_j`**: learnable per-agent rule-interpretation vector,
@@ -106,7 +106,8 @@ autograd.
 - **Intent matrix `Z`**: shape `(n_agents, D)`, where each row `z_j` is an
   observer's interpretation of an action. The actor's own row is zeroed in
   `compute_Z`.
-- **Future tree**: recursively generated state tree over bids and responses.
+- **Future tree**: recursively generated state tree over grounded actions and
+  adapter-provided responses/events.
   It evaluates optionality, risk floor, and expected path quality.
 
 ## Important Dimensions
@@ -138,8 +139,9 @@ The canonical public entry point is `CognitiveAgent.act` in `agent.py`.
 
 1. `CandidateInterventionGenerator` reads actor/counterpart situations,
    relation edge, and context to generate latent action vectors.
-2. The adapter decodes each latent action into an executable intervention.
-3. `build_signal(action, context)` creates `s` for each grounded action.
+2. The adapter decodes each latent action into a `GroundedAction`.
+3. `adapter.encode_action_signal(action, context)` creates `s` for each
+   grounded action.
 4. `CognitiveAgent` builds `r_dict` from each `RuleInterpretation.r_j`.
 5. `CognitiveAgent` builds `sigma_dict` via `sigma_of(j)`.
 6. `InterpretationEngine.compute_Z` computes every observer row of `Z`.
@@ -202,14 +204,23 @@ semantics, and outcome quality come from the adapter.
 candidates under one root. `evaluate` normalizes leaf probability mass before
 computing tree metrics.
 
+### `game_spec.py` / `generic_adapter.py`
+
+`GameSpec` is the preferred way to add a game. It declares entities, role
+bindings, state variables, action controls, responses/events, transition
+effects, outcome features, and optional quality expressions. The DSL includes
+small expression objects such as `state(...)`, `control(...)`, `payoff(...)`
+and effects such as `AddPayoff`, `SetState`, `ScaleState`, and `SetTerminal`.
+
+`GenericGameAdapter` interprets a `GameSpec` and exposes the stable adapter
+contract consumed by the agent. It handles latent-action decoding for
+continuous, binary, and categorical controls.
+
 ### `game_adapter.py`
 
-`UltimatumGameAdapter` contains the toy-game-specific pieces that should not
-belong to the core agent: A/B/C entity positions, action affordance boundaries,
-latent-action decoding into kept-share bids, `accept/reject/counter` labels,
-initial resources, public knowledge, payoff transitions, raw outcome
-resolution, and outcome utility feature names. Future environments should
-provide a different adapter instead of editing `CognitiveAgent`.
+`UltimatumGameAdapter` is now only a backward-compatible wrapper around the
+declarative Ultimatum spec. New games should be added under `specs/` and run
+through `GenericGameAdapter`, not by creating another handwritten adapter.
 
 ### `action_model.py`
 
@@ -273,8 +284,8 @@ The public loop is `act(...) -> observe(response) -> learn(outcome)`.
 
 ### `decision.py`
 
-`CandidateIntervention` represents an adapter-decoded action, optional latent
-action vector, and outgoing communicative signal. `PredictedFuture` keeps each
+`CandidateIntervention` represents a `GroundedAction`, optional latent action
+vector, and outgoing communicative signal. `PredictedFuture` keeps each
 `T(action, signal)` separate.
 `FuturePositionEvaluator` is a learnable utility interface over planner
 metrics. `DecisionEngine` turns predicted futures into candidate scores,
@@ -341,6 +352,9 @@ syntax issue.
   `BranchPolicy` derive their sizes from the adapter.
 - **Changing action formation**: edit `action_model.py` for latent generation
   and the adapter's `action_affordance` / `decode_action` for grounding.
+- **Adding a new game**: create a `GameSpec` under `specs/`, instantiate it via
+  `GenericGameAdapter`, and add a contract test. Avoid adding a handwritten
+  adapter unless the game truly needs an external simulator hook.
 - **Changing dimensions**: update `config.py` first and keep `sanity_check`
   strict. Then update all dependent layer widths.
 - **Changing tree value**: edit `FutureTreeGen._quality` or `evaluate`, while
@@ -371,12 +385,11 @@ OK: agent generated actions/signals and gradients flowed through G, I, T, A, S, 
 The active architecture goal is broader than this baseline. See
 `docs/first-principles-ai-architecture.md` for the target design. Current
 implemented slices: the agent can generate latent actions, ground them through
-the adapter, generate learned outgoing signals, simulate candidate
+`GenericGameAdapter`, generate learned outgoing signals, simulate candidate
 action/signal interventions, score predicted futures, choose its own
 intervention, resolve a raw observed outcome, evaluate realized utility, expose
 `act/observe/learn`, and separate response-prediction, value, and policy
-losses. Toy-game-specific roles/affordances/responses/outcome features now live
-in `UltimatumGameAdapter` instead of the core loop. The broader goal remains
-active: richer experience-driven value/preference learning and stronger
+losses. The repo includes six declarative benchmark specs. The broader goal
+remains active: richer experience-driven value/preference learning and stronger
 multi-scenario tests for understanding-as-action improvement still need to be
 added.

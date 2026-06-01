@@ -46,7 +46,7 @@ def main():
         decision = out["decision"]
         future = decision.selected_future
         bid = decision.selected.action
-        bid_value = float(torch.as_tensor(bid).detach())
+        bid_value = float(bid)
         Z, metrics = future.Z, future.metrics
 
         # Observe an outcome from the response model. This remains a raw

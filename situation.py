@@ -37,16 +37,16 @@ class HistorySummarizer(nn.Module):
     resp_onehot is over adapter-provided observable response labels.
     """
 
-    HIST_SIGNAL_DIM = config.M
-
-    def __init__(self, dim=config.H_DIM, d=config.D, response_labels=None):
+    def __init__(self, dim=config.H_DIM, d=config.D, response_labels=None,
+                 signal_dim=config.M):
         super().__init__()
         self.dim = dim
         self.d = d
+        self.signal_dim = int(signal_dim)
         self.response_labels = tuple(
             response_labels if response_labels is not None
             else ("observed",))
-        input_dim = self.HIST_SIGNAL_DIM + len(self.response_labels) + d
+        input_dim = self.signal_dim + len(self.response_labels) + d
         self.W_enc = nn.Linear(input_dim, dim, bias=True)
 
     def response_onehot(self, response, device=None, dtype=torch.float32):

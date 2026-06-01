@@ -16,6 +16,11 @@ from situation import (
     RoleEmbedding, HistorySummarizer, init_resource, update_resource,
     init_knowledge, build_sigma,
 )
+from game_spec import (
+    ActionAffordance, ControlSpec, EntitySpec, FeatureSpec, GameSpec,
+    GroundedAction, ResponseSpec, RoleBinding, StateVarSpec, TransitionSpec,
+)
+from generic_adapter import GenericGameAdapter
 from game_rule import UltimatumRule
 from game_adapter import EntitySet, UltimatumGameAdapter
 from future_tree import FutureTreeGen, BranchPolicy, Node
@@ -42,6 +47,9 @@ __all__ = [
     "ToleranceHead", "build_signal", "build_context", "dissonance_loss",
     "RoleEmbedding", "HistorySummarizer", "init_resource", "update_resource",
     "init_knowledge", "build_sigma",
+    "ActionAffordance", "ControlSpec", "EntitySpec", "FeatureSpec",
+    "GameSpec", "GroundedAction", "ResponseSpec", "RoleBinding",
+    "StateVarSpec", "TransitionSpec", "GenericGameAdapter",
     "UltimatumRule",
     "EntitySet", "UltimatumGameAdapter",
     "FutureTreeGen", "BranchPolicy", "Node",

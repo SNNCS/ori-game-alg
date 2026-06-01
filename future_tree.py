@@ -46,21 +46,23 @@ class BranchPolicy(nn.Module):
     and even its effect is learned through w_action.
     """
 
-    def __init__(self, d=config.D, n_responses=3,
+    def __init__(self, d=config.D, n_responses=3, action_feature_dim=3,
                  signal_dim=config.SIGNAL_DIM, use_tolerance=True):
         super().__init__()
         self.use_tolerance = use_tolerance
         self.n_responses = int(n_responses)
+        self.action_feature_dim = int(action_feature_dim)
         self.W_resp = nn.Linear(d, self.n_responses, bias=True)
-        self.w_action = nn.Linear(1, self.n_responses, bias=False)
+        self.w_action = nn.Linear(self.action_feature_dim, self.n_responses,
+                                  bias=False)
         self.w_signal = nn.Linear(signal_dim, self.n_responses, bias=False)
         if use_tolerance:
             self.w_tol = nn.Linear(1, self.n_responses, bias=False)
 
-    def forward(self, z_B, action, tolerance=None, comm_signal=None):
-        action_t = torch.as_tensor(action, device=z_B.device, dtype=z_B.dtype)
-        gap = action_t.reshape(1) - 0.5
-        logits = self.W_resp(z_B) + self.w_action(gap)
+    def forward(self, z_B, action_features, tolerance=None, comm_signal=None):
+        action_features = torch.as_tensor(
+            action_features, device=z_B.device, dtype=z_B.dtype).reshape(-1)
+        logits = self.W_resp(z_B) + self.w_action(action_features)
         if comm_signal is not None:
             logits = logits + self.w_signal(comm_signal.to(z_B.dtype))
         if self.use_tolerance and tolerance is not None:
@@ -96,8 +98,11 @@ class FutureTreeGen(nn.Module):
         self.adapter = adapter if adapter is not None else UltimatumGameAdapter(rule)
         self.d = d
         self.tolerance_head = tolerance_head      # optional ToleranceHead
+        self.action_feature_dim = int(getattr(
+            self.adapter, "branch_action_feature_dim", 3))
         self.policy = BranchPolicy(
             d=d, n_responses=len(self.adapter.response_labels()),
+            action_feature_dim=self.action_feature_dim,
             signal_dim=signal_dim,
             use_tolerance=tolerance_head is not None)
 
@@ -115,8 +120,10 @@ class FutureTreeGen(nn.Module):
         tol = None
         if self.tolerance_head is not None:
             tol = self.tolerance_head(z_B)
+        action_features = self.adapter.branch_action_features(
+            action, device=z_B.device, dtype=z_B.dtype)
         return self.policy(
-            z_B, action, tolerance=tol, comm_signal=comm_signal)
+            z_B, action_features, tolerance=tol, comm_signal=comm_signal)
 
     # ----- transition ------------------------------------------------------
 
@@ -211,9 +218,14 @@ class FutureTreeGen(nn.Module):
         self._collect_leaves(root, leaves)
         P = torch.stack([leaf.prob for leaf in leaves])
         P = P / (P.sum() + 1e-8)
-        Q = torch.tensor([self.adapter.outcome_quality(leaf.state, role)
-                          for leaf in leaves],
-                         dtype=P.dtype, device=P.device)
+        Q = torch.stack([
+            torch.as_tensor(
+                self.adapter.outcome_quality(leaf.state, role),
+                dtype=P.dtype,
+                device=P.device,
+            ).reshape(())
+            for leaf in leaves
+        ])
         H = -(P * torch.log(P + 1e-12)).sum()
         H_max = torch.log(torch.tensor(float(max(len(P), 1)),
                                        dtype=P.dtype, device=P.device)) + 1e-12
