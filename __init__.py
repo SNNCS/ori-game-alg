@@ -22,10 +22,27 @@ from game_spec import (
 )
 from generic_adapter import GenericGameAdapter
 from game_rule import UltimatumRule
-from game_adapter import EntitySet, UltimatumGameAdapter
-from future_tree import FutureTreeGen, BranchPolicy, Node
+from game_spec import EntitySet
+from future_tree import (
+    FutureTreeGen, BranchPolicy, Node, WorldResponseDistribution,
+    WorldResponseModel, CounterfactualPlanner, FutureValueModel,
+)
 from signal_model import OutgoingSignal, SignalGenerator
-from action_model import GeneratedInterventions, CandidateInterventionGenerator
+from action_model import (
+    ActionPolicyOutput, GeneratedInterventions,
+    CandidateInterventionGenerator,
+)
+from belief import BeliefState
+from runtime import (
+    ActionEvent, CheckpointMetadata, Observation, ObservationSpec,
+    RuntimeSchema, RuntimeSnapshot, SchemaCompatibilityReport,
+    TerminalOutcome, TransitionResult, WorldResponse,
+    check_schema_compatibility,
+)
+from trajectory import (
+    LearningCoordinator, OutcomeTargetBuilder, ReturnBuilder, ReturnTarget,
+    Trajectory, TrajectoryStep,
+)
 from decision import (
     CandidateIntervention, PredictedFuture, DecisionResult,
     FuturePositionEvaluator, DecisionEngine,
@@ -33,11 +50,11 @@ from decision import (
 from experience import (
     Outcome, RealizedUtility, LearningSignal, ExperienceStep,
     OutcomeFeatureEncoder, OutcomeUtilityEvaluator,
-    resolve_ultimatum_outcome, build_learning_signal,
+    build_learning_signal,
 )
 from evaluation import (
     AblationSpec, UsefulnessReport, NO_UNDERSTANDING, NO_SIGNAL,
-    compare_decisions,
+    ArchitectureGateReport, compare_decisions, runtime_gate_report,
 )
 from agent import CognitiveAgent
 
@@ -51,16 +68,26 @@ __all__ = [
     "GameSpec", "GroundedAction", "ResponseSpec", "RoleBinding",
     "StateVarSpec", "TransitionSpec", "GenericGameAdapter",
     "UltimatumRule",
-    "EntitySet", "UltimatumGameAdapter",
-    "FutureTreeGen", "BranchPolicy", "Node",
+    "EntitySet",
+    "FutureTreeGen", "BranchPolicy", "Node", "WorldResponseDistribution",
+    "WorldResponseModel", "CounterfactualPlanner", "FutureValueModel",
     "OutgoingSignal", "SignalGenerator",
-    "GeneratedInterventions", "CandidateInterventionGenerator",
+    "ActionPolicyOutput", "GeneratedInterventions",
+    "CandidateInterventionGenerator",
+    "BeliefState",
+    "ActionEvent", "CheckpointMetadata", "Observation", "ObservationSpec",
+    "RuntimeSchema", "RuntimeSnapshot", "SchemaCompatibilityReport",
+    "TerminalOutcome", "TransitionResult", "WorldResponse",
+    "check_schema_compatibility",
+    "LearningCoordinator", "OutcomeTargetBuilder", "ReturnBuilder",
+    "ReturnTarget", "Trajectory", "TrajectoryStep",
     "CandidateIntervention", "PredictedFuture", "DecisionResult",
     "FuturePositionEvaluator", "DecisionEngine",
     "Outcome", "RealizedUtility", "LearningSignal", "ExperienceStep",
     "OutcomeFeatureEncoder", "OutcomeUtilityEvaluator",
-    "resolve_ultimatum_outcome", "build_learning_signal",
-    "AblationSpec", "UsefulnessReport", "NO_UNDERSTANDING", "NO_SIGNAL",
-    "compare_decisions",
+    "build_learning_signal",
+    "AblationSpec", "UsefulnessReport", "ArchitectureGateReport",
+    "NO_UNDERSTANDING", "NO_SIGNAL", "compare_decisions",
+    "runtime_gate_report",
     "CognitiveAgent",
 ]

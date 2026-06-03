@@ -12,6 +12,10 @@ from experience import Outcome
 from game_spec import (
     ActionAffordance, EntitySet, GameSpec, GroundedAction,
 )
+from runtime import (
+    ActionEvent, Observation, ObservationSpec, RuntimeSchema,
+    RuntimeSnapshot, TerminalOutcome, TransitionResult, WorldResponse,
+)
 
 
 class GenericRule:
@@ -68,6 +72,29 @@ class GenericGameAdapter:
     def observer_actor(self):
         return self.entities.observer
 
+    def counterpart_for_actor(self, actor):
+        actor = int(actor)
+        if actor == self.focal_actor:
+            return self.counterpart_actor
+        if actor == self.counterpart_actor:
+            return self.focal_actor
+        raise ValueError(
+            f"No default counterpart declared for actor {actor}. "
+            "Override counterpart_for_actor/response_actor for this spec.")
+
+    def response_actor(self, snapshot=None, action_event=None,
+                       world_response=None, actor=None):
+        if isinstance(world_response, WorldResponse):
+            if world_response.source is not None:
+                return int(world_response.source)
+        if isinstance(action_event, ActionEvent):
+            return self.counterpart_for_actor(action_event.actor)
+        if actor is not None:
+            return self.counterpart_for_actor(actor)
+        if isinstance(snapshot, RuntimeSnapshot) and snapshot.current_actor is not None:
+            return self.counterpart_for_actor(snapshot.current_actor)
+        return self.counterpart_actor
+
     def resolve_role(self, role):
         if isinstance(role, int):
             return role
@@ -84,8 +111,22 @@ class GenericGameAdapter:
     def response_labels(self):
         return tuple(response.label for response in self.spec.responses)
 
-    def action_affordance(self, state=None):
+    def runtime_schema(self):
+        return RuntimeSchema(
+            spec_name=self.spec.name,
+            spec_version=getattr(self.spec, "schema_version", "1"),
+            observation_features=tuple(var.name for var in self.spec.state_vars),
+            action_controls=tuple(control.name
+                                  for control in self.spec.action_controls),
+            world_response_labels=self.response_labels(),
+            outcome_features=self.outcome_feature_names,
+            n_entities=self.entities.n_entities,
+        )
+
+    def action_affordance(self, state=None, actor=None):
         primary = self.spec.action_controls[0]
+        if isinstance(state, RuntimeSnapshot):
+            state = state.state
         return ActionAffordance(
             low=float(primary.low),
             high=float(primary.high),
@@ -141,7 +182,7 @@ class GenericGameAdapter:
             controls={primary.name: value},
             primary_value=value,
             display=f"{primary.name}={float(value.detach()):.3f}",
-            metadata={"spec": self.spec.name, "source": "scalar_compat"},
+            metadata={"spec": self.spec.name, "source": "scalar"},
         )
 
     def validate_intervention(self, action):
@@ -176,6 +217,21 @@ class GenericGameAdapter:
             actions.append(self.decode_action(latent))
         return tuple(actions)
 
+    def initial_runtime_snapshot(self, sigma_root=None, current_actor=None):
+        state = self.initial_tree_state(sigma_root)
+        return RuntimeSnapshot(
+            state=state,
+            current_actor=(
+                self.focal_actor if current_actor is None else current_actor),
+            terminal=bool(state.get("terminal", False)),
+            public={
+                key: value for key, value in state.items()
+                if key not in ("payoffs", "sigma")
+            },
+            private={},
+            metadata={"spec": self.spec.name},
+        )
+
     def initial_resource_map(self):
         return {i: 0.0 for i in range(self.entities.n_entities)}
 
@@ -192,14 +248,21 @@ class GenericGameAdapter:
         state["payoffs"] = self.initial_resource_map()
         state["terminal"] = False
         state["sigma"] = sigma_root
-        self._sync_compat_payoffs(state)
+        self._ensure_payoffs(state)
         return state
 
     def is_continue_response(self, response):
+        response = self._response_label(response)
         return self._responses[response].continue_branch
 
     def intent_shift_for_response(self, response):
+        response = self._response_label(response)
         return float(self._responses[response].intent_shift)
+
+    def _response_label(self, response):
+        if isinstance(response, WorldResponse):
+            return response.label
+        return response
 
     def _state_for_ctx(self, state):
         copied = dict(state)
@@ -208,6 +271,7 @@ class GenericGameAdapter:
 
     def _ctx(self, state, action, response):
         action = self._coerce_action(action) if action is not None else action
+        response = self._response_label(response)
         return {
             "state": state,
             "action": action,
@@ -216,23 +280,257 @@ class GenericGameAdapter:
             "adapter": self,
         }
 
-    def _sync_compat_payoffs(self, state):
-        payoffs = state.setdefault("payoffs", self.initial_resource_map())
-        state["payoff_A"] = payoffs.get(self.focal_actor, 0.0)
-        state["payoff_B"] = payoffs.get(self.counterpart_actor, 0.0)
+    def _ensure_payoffs(self, state):
+        state.setdefault("payoffs", self.initial_resource_map())
         return state
 
     def transition(self, state, action, response):
         new_state = self._state_for_ctx(state)
         ctx = self._ctx(new_state, action, response)
+        response = self._response_label(response)
         transition = self._transitions.get(response)
         if transition is not None:
             for effect in transition.effects:
                 effect.apply(ctx)
             if transition.hook is not None:
                 transition.hook(ctx)
-        self._sync_compat_payoffs(new_state)
+        self._ensure_payoffs(new_state)
         return new_state
+
+    def continuation_action(self, state, previous_action, previous_response):
+        """Optional simulator hook for deterministic continuation actions.
+
+        The generic core does not invent the next agent's strategy. Rich
+        applications can override this hook or provide an external simulator
+        adapter; the default keeps continuation branches as leaves for future
+        value estimation.
+        """
+        return None
+
+    # ----- runtime wrappers ----------------------------------------------
+
+    def _public_observation_items(self, snapshot):
+        if not isinstance(snapshot, RuntimeSnapshot):
+            snapshot = RuntimeSnapshot(state=snapshot)
+        state_var_names = {var.name for var in self.spec.state_vars}
+        names = []
+        values = []
+        for var in self.spec.state_vars:
+            names.append(var.name)
+            values.append(snapshot.state.get(
+                var.name, snapshot.public.get(var.name, var.init)))
+        public_source = (
+            snapshot.public if snapshot.public else {
+                key: value for key, value in snapshot.state.items()
+                if key not in ("payoffs", "sigma")
+            }
+        )
+        for key in sorted(public_source):
+            if key not in state_var_names and key not in ("payoffs", "sigma"):
+                names.append(key)
+                values.append(public_source[key])
+        return tuple(names), values
+
+    def _private_observation_items(self, snapshot, viewer):
+        if not isinstance(snapshot, RuntimeSnapshot):
+            snapshot = RuntimeSnapshot(state=snapshot)
+        private_state = snapshot.private.get(int(viewer), {})
+        names = tuple(sorted(private_state))
+        values = [private_state[key] for key in names]
+        return names, values
+
+    def _flatten_feature_names(self, names, values, dim=None):
+        flat_names: list[str] = []
+        for name, value in zip(names, values):
+            width = int(self._flatten_numeric(value).numel())
+            if width == 0:
+                continue
+            if width == 1:
+                flat_names.append(str(name))
+            else:
+                flat_names.extend(f"{name}[{idx}]" for idx in range(width))
+        if dim is not None:
+            flat_names = flat_names[:dim]
+        return tuple(flat_names)
+
+    def observation_spec(self, snapshot=None, viewer=None, dim=config.K_DIM):
+        if snapshot is None:
+            public_names = tuple(var.name for var in self.spec.state_vars)
+            private_names = ()
+        else:
+            if viewer is None:
+                viewer = self.focal_actor
+            public_base_names, public_values = self._public_observation_items(
+                snapshot)
+            private_base_names, private_values = self._private_observation_items(
+                snapshot, viewer)
+            public_names = self._flatten_feature_names(
+                public_base_names, public_values, dim=dim)
+            remaining = (
+                None if dim is None else max(int(dim) - len(public_names), 0))
+            private_names = self._flatten_feature_names(
+                private_base_names, private_values, dim=remaining)
+        return ObservationSpec(
+            feature_names=public_names,
+            private_feature_names=private_names,
+            dim=dim,
+            schema_version=getattr(self.spec, "schema_version", "1"),
+        )
+
+    @staticmethod
+    def _flatten_numeric(value, device=None, dtype=torch.float32):
+        if isinstance(value, bool):
+            value = float(value)
+        if isinstance(value, (int, float)) or torch.is_tensor(value):
+            tensor = torch.as_tensor(value, device=device, dtype=dtype)
+            return tensor.reshape(-1)
+        return torch.zeros(0, device=device, dtype=dtype)
+
+    def _pack_features(self, values, dim=config.K_DIM, device=None,
+                       dtype=torch.float32, pad=True):
+        chunks = [
+            self._flatten_numeric(value, device=device, dtype=dtype)
+            for value in values
+        ]
+        numeric_chunks = [chunk for chunk in chunks if chunk.numel() > 0]
+        if numeric_chunks:
+            vec = torch.cat(numeric_chunks)
+        else:
+            vec = torch.zeros(0, device=device, dtype=dtype)
+        if dim is not None:
+            vec = vec[:dim]
+        mask = torch.ones(vec.numel(), device=vec.device, dtype=dtype)
+        if pad and dim is not None and vec.numel() < dim:
+            pad = torch.zeros(dim - vec.numel(), device=vec.device, dtype=dtype)
+            vec = torch.cat([vec, pad])
+            mask = torch.cat([
+                mask,
+                torch.zeros(dim - mask.numel(), device=vec.device, dtype=dtype),
+            ])
+        return vec, mask
+
+    def encode_public_state(self, snapshot, dim=config.K_DIM,
+                            device=None, dtype=torch.float32):
+        _, values = self._public_observation_items(snapshot)
+        return self._pack_features(values, dim=dim, device=device, dtype=dtype)
+
+    def encode_private_state(self, snapshot, viewer, dim=config.K_DIM,
+                             device=None, dtype=torch.float32):
+        _, values = self._private_observation_items(snapshot, viewer)
+        return self._pack_features(values, dim=dim, device=device, dtype=dtype)
+
+    def encode_observation(self, snapshot, viewer=None, dim=config.K_DIM,
+                           device=None, dtype=torch.float32):
+        if not isinstance(snapshot, RuntimeSnapshot):
+            snapshot = RuntimeSnapshot(state=snapshot)
+        if viewer is None:
+            viewer = self.focal_actor
+        _, public_values = self._public_observation_items(snapshot)
+        _, private_values = self._private_observation_items(snapshot, viewer)
+        public_vec, public_mask = self._pack_features(
+            public_values, dim=None, device=device, dtype=dtype, pad=False)
+        private_vec, private_mask = self._pack_features(
+            private_values, dim=None, device=public_vec.device,
+            dtype=public_vec.dtype, pad=False)
+        vector = torch.cat([public_vec, private_vec])[:dim]
+        mask = torch.cat([public_mask, private_mask])[:dim]
+        if vector.numel() < dim:
+            pad = torch.zeros(
+                dim - vector.numel(), device=vector.device,
+                dtype=vector.dtype)
+            vector = torch.cat([vector, pad])
+            mask = torch.cat([mask, torch.zeros_like(pad)])
+        spec = self.observation_spec(snapshot=snapshot, viewer=viewer, dim=dim)
+        return Observation(
+            viewer=int(viewer),
+            vector=vector,
+            mask=mask,
+            spec=spec,
+            public_state=dict(snapshot.public),
+            private_state=dict(snapshot.private.get(int(viewer), {})),
+            snapshot_step=int(snapshot.step_index),
+        )
+
+    def legal_action_mask(self, snapshot=None, actor=None):
+        if snapshot is None:
+            return None
+        if not isinstance(snapshot, RuntimeSnapshot):
+            return None
+        actor = self.focal_actor if actor is None else int(actor)
+        mask = snapshot.legal_action_mask.get(actor)
+        if mask is None:
+            return None
+        return torch.as_tensor(mask, dtype=torch.bool)
+
+    def ground_action(self, action_or_policy, snapshot=None, actor=None):
+        actor = self.focal_actor if actor is None else int(actor)
+        log_prob = getattr(action_or_policy, "log_prob", None)
+        action = getattr(action_or_policy, "grounded_action", None)
+        if action is None:
+            action = action_or_policy
+        action = self._coerce_action(action)
+        return ActionEvent(
+            actor=actor,
+            action=action,
+            label=action.display,
+            controls=dict(action.controls),
+            log_prob=log_prob,
+            metadata={"spec": self.spec.name},
+        )
+
+    def transition_event(self, snapshot, action_event, world_response):
+        if not isinstance(action_event, ActionEvent):
+            raise TypeError("transition_event requires an ActionEvent.")
+        if not isinstance(world_response, WorldResponse):
+            raise TypeError("transition_event requires a WorldResponse.")
+        before = snapshot if isinstance(snapshot, RuntimeSnapshot) else RuntimeSnapshot(
+            state=snapshot)
+        next_state = self.transition(
+            before.state, action_event.action, world_response)
+        after = RuntimeSnapshot(
+            state=next_state,
+            current_actor=before.current_actor,
+            step_index=before.step_index + 1,
+            terminal=bool(next_state.get("terminal", False)),
+            public={
+                key: value for key, value in next_state.items()
+                if key not in ("payoffs", "sigma")
+            },
+            private=before.private,
+            legal_action_mask=before.legal_action_mask,
+            metadata=dict(before.metadata),
+        )
+        terminal = None
+        if after.terminal:
+            terminal = TerminalOutcome(
+                snapshot=after,
+                payoffs=dict(next_state.get("payoffs", {})),
+                terminal=True,
+                metadata={"world_response": world_response.label},
+            )
+        return TransitionResult(
+            before=before,
+            action_event=action_event,
+            world_response=world_response,
+            after=after,
+            terminal_outcome=terminal,
+        )
+
+    def outcome_from_transition(self, transition_result):
+        state = transition_result.after.state
+        payoffs = dict(state.get("payoffs", {}))
+        features = {
+            key: value for key, value in state.items()
+            if key not in ("payoffs", "sigma")
+        }
+        return Outcome(
+            action=transition_result.action_event.action,
+            world_response=transition_result.world_response,
+            terminal=bool(state.get("terminal", False)),
+            raw_state=state,
+            entity_payoffs=payoffs,
+            features=features,
+        )
 
     def branch_action_features(self, action, device=None, dtype=torch.float32):
         values = []
@@ -277,26 +575,7 @@ class GenericGameAdapter:
         if self.spec.quality_expr is not None:
             return self.spec.quality_expr.eval(ctx)
         role = self.resolve_role(role)
-        return ctx["payoffs"].get(role, 0.0) + 0.2 * state.get("paths_open", 0.0)
-
-    def resolve_outcome(self, action, response, pie=1.0):
-        state = self.initial_tree_state()
-        if "pie" in state:
-            state["pie"] = float(pie)
-        next_state = self.transition(state, action, response)
-        payoffs = dict(next_state.get("payoffs", {}))
-        return Outcome(
-            action=action,
-            response=response,
-            pie_after=float(torch.as_tensor(next_state.get("pie", pie)).detach()),
-            paths_open=float(torch.as_tensor(
-                next_state.get("paths_open", 0.0)).detach()),
-            terminal=bool(next_state.get("terminal", False)),
-            raw_state=next_state,
-            entity_payoffs=payoffs,
-            payoff_A=payoffs.get(self.focal_actor, 0.0),
-            payoff_B=payoffs.get(self.counterpart_actor, 0.0),
-        )
+        return ctx["payoffs"].get(role, 0.0)
 
     def outcome_features(self, outcome, role, device=None, dtype=torch.float32):
         raw_state = dict(outcome.raw_state)

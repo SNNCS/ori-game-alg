@@ -19,6 +19,8 @@ import torch
 import config
 from agent import CognitiveAgent
 from interpretation import build_context
+from runtime import WorldResponse
+from trajectory import Trajectory
 
 
 def grad_norm(module):
@@ -40,10 +42,11 @@ def main():
     for step in range(5):
         ctx = build_context(turn_idx=step, session_len=8,
                             prev_reject_rate=0.2, status_gap=0.1)
+        snapshot = agent.runtime_snapshot()
 
         # The proposer now chooses its own bid by simulating candidate futures.
-        out = agent.act(context=ctx)
-        decision = out["decision"]
+        action_event = agent.act(snapshot=snapshot, context=ctx)
+        decision = agent._last_decision
         future = decision.selected_future
         bid = decision.selected.action
         bid_value = float(bid)
@@ -54,8 +57,14 @@ def main():
         root_probs = torch.stack(
             [child.prob for child in future.tree.children]).detach()
         resp = response_labels[int(torch.argmax(root_probs))]
-        outcome = agent.observe(resp, decision=decision)
-        experience = agent.learn(outcome, decision=decision)
+        transition = agent.transition_runtime(
+            snapshot, action_event, WorldResponse(resp))
+        step_record = agent.build_trajectory_step(
+            decision, action_event, transition)
+        learning_signal = agent.learn(
+            Trajectory((step_record,), transition.terminal_outcome))
+        experience = agent._last_experience
+        outcome = experience.outcome
         focal_payoff = outcome.payoff_for(
             agent.adapter.focal_actor, adapter=agent.adapter)
 
@@ -64,7 +73,7 @@ def main():
         L_diss = agent.dissonance(future.signal_vec, Z)
         L_reg = agent.rule_reg()
         expected_position = decision.expected_utility
-        L_exp = experience.learning_signal.total_loss
+        L_exp = learning_signal.total_loss
         loss = L_diss + 0.01 * L_reg + L_exp
 
         opt.zero_grad()

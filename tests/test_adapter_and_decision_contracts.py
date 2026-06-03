@@ -4,9 +4,9 @@ import torch
 
 import config
 from agent import CognitiveAgent
-from game_adapter import UltimatumGameAdapter
-from game_rule import UltimatumRule
+from generic_adapter import GenericGameAdapter
 from interpretation import build_context
+from specs.ultimatum import build_ultimatum_spec
 
 
 class AdapterAndDecisionContractTests(unittest.TestCase):
@@ -16,8 +16,10 @@ class AdapterAndDecisionContractTests(unittest.TestCase):
     def test_agent_generates_latent_actions_before_adapter_grounding(self):
         agent = CognitiveAgent()
         context = build_context(turn_idx=1, session_len=8)
+        snapshot = agent.runtime_snapshot()
 
-        generated = agent.generate_candidate_interventions(context=context)
+        generated = agent.generate_candidate_interventions(
+            context=context, snapshot=snapshot)
         affordance = agent.adapter.action_affordance()
 
         self.assertEqual(
@@ -40,15 +42,14 @@ class AdapterAndDecisionContractTests(unittest.TestCase):
             self.assertTrue(agent.adapter.validate_intervention(candidate.action))
 
     def test_adapter_response_count_drives_history_and_branch_policy_sizes(self):
-        adapter = UltimatumGameAdapter(
-            UltimatumRule(),
-            responses=("accept", "reject", "counter", "delay"),
-        )
+        adapter = GenericGameAdapter(build_ultimatum_spec(
+            responses=("accept", "reject", "counter", "delay")))
         agent = CognitiveAgent(adapter=adapter)
         context = build_context(turn_idx=0, session_len=8)
+        snapshot = agent.runtime_snapshot()
 
-        acted = agent.act(context=context)
-        selected_tree = acted["decision"].selected_future.tree
+        agent.act(snapshot=snapshot, context=context)
+        selected_tree = agent._last_decision.selected_future.tree
 
         self.assertEqual(agent.tree.policy.n_responses, 4)
         self.assertEqual(agent.history.W_enc.in_features, config.M + 4 + config.D)
@@ -57,9 +58,9 @@ class AdapterAndDecisionContractTests(unittest.TestCase):
     def test_decision_scores_all_candidate_futures(self):
         agent = CognitiveAgent()
         context = build_context(turn_idx=2, session_len=8)
+        snapshot = agent.runtime_snapshot()
 
-        out = agent.deliberate(context=context)
-        decision = out["decision"]
+        decision = agent.deliberate(snapshot=snapshot, context=context)
 
         self.assertEqual(len(decision.futures), config.N_GENERATED_ACTIONS)
         self.assertEqual(decision.scores.shape, (config.N_GENERATED_ACTIONS,))

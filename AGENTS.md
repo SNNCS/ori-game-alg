@@ -40,9 +40,10 @@ autograd.
 
 ## Non-Negotiable Design Invariants
 
-- Keep the repository specific to the Ultimatum Game. Do not reintroduce
-  e-commerce concepts, recommendation flows, discount actions, purchase
-  outcomes, or LLM prompt/prefix machinery.
+- Keep the core architecture generic over declarative `GameSpec` and typed
+  runtime contracts. Ultimatum is the default smoke-test spec, not a core
+  assumption. Do not reintroduce e-commerce concepts, recommendation flows,
+  discount actions, purchase outcomes, or LLM prompt/prefix machinery.
 - `G` must remain a trainable `nn.Parameter`. Do not replace it with manual
   edge-update code or a detached table.
 - Clamp relation edges on read, not by in-place mutation during forward passes.
@@ -69,21 +70,23 @@ autograd.
 | `config.py` | Global constants, dimensions, hyperparameters, and sanity checks. |
 | `game_spec.py` | Declarative game schema, expression DSL, transition effects, and grounded actions. |
 | `generic_adapter.py` | Generic `GameSpec` interpreter exposing the adapter contract. |
-| `game_rule.py` | Backward-compatible Ultimatum rule facade. |
+| `game_rule.py` | Ultimatum rule prior used by the built-in spec/rule stance. |
 | `relation_graph.py` | Structure `G`: trainable directed relation tensor. |
 | `situation.py` | Role embeddings, history summaries, resource state, public knowledge, and `sigma` assembly. |
 | `interpretation.py` | Structure `I`: signal construction, intent inference, propagation, rule stance, Bayesian inverse, tolerance head, dissonance loss. |
-| `game_adapter.py` | Backward-compatible `UltimatumGameAdapter` wrapper over `GenericGameAdapter`. |
+| `runtime.py` | RuntimeSnapshot, Observation, ActionEvent, WorldResponse, TransitionResult, TerminalOutcome, and schema checks. |
+| `belief.py` | Explicit BeliefState assembled from runtime observations and interpreted actions. |
 | `action_model.py` | Learnable latent action generation before adapter grounding. |
 | `specs/` | Built-in benchmark specs: Ultimatum, Prisoner's Dilemma, Chicken, Stag Hunt, Public Goods, First-price Auction. |
-| `future_tree.py` | Structure `T`: branch policy, recursive future tree, path dependence, and evaluation metrics. |
+| `future_tree.py` | Structure `T`: world-response model, counterfactual planner, branch policy, path dependence, and evaluation metrics. |
 | `signal_model.py` | Learnable outgoing communicative signal generation. |
 | `decision.py` | Candidate interventions, predicted futures, future-position scoring, and action selection. |
-| `experience.py` | Raw outcomes, realized utility, and separated prediction/value/policy learning signals. |
+| `experience.py` | Raw outcomes, realized utility, and single-step prediction/value/policy helpers. |
+| `trajectory.py` | Trajectory steps, role-relative return targets, and learning coordinator. |
 | `evaluation.py` | Ablation specs and usefulness reports for understanding-as-action-improvement probes. |
 | `agent.py` | Composition layer wiring all structures into `CognitiveAgent`. |
 | `demo.py` | End-to-end smoke test and gradient-flow verification. |
-| `verify_architecture.py` | Lightweight verification for act/observe/learn, outgoing signals, and ablation sensitivity. |
+| `verify_architecture.py` | Lightweight verification for runtime action/transition/trajectory learning, outgoing signals, and ablation sensitivity. |
 | `__init__.py` | Public exports for the package-style API. |
 | `README.md` | User-facing overview and minimal example. |
 | `docs/first-principles-ai-architecture.md` | Target architecture for closing the loop from signal understanding to self-beneficial action. |
@@ -100,14 +103,15 @@ autograd.
 - **Relation edge `G[j,i,:]`**: observer `j`'s directed relational view of actor
   `i`, shape `K=32`.
 - **Rule stance `r_j`**: learnable per-agent rule-interpretation vector,
-  shape `P=16`, regularized toward `UltimatumRule.r_public`.
+  shape `P=16`, regularized toward the active spec's public rule prior.
 - **Situation `sigma_j`**: concatenation of role embedding, history summary,
   resource vector, and public knowledge, shape `SIGMA_DIM=40`.
 - **Intent matrix `Z`**: shape `(n_agents, D)`, where each row `z_j` is an
   observer's interpretation of an action. The actor's own row is zeroed in
   `compute_Z`.
-- **Future tree**: recursively generated state tree over grounded actions and
-  adapter-provided responses/events.
+- **Future tree**: generated state tree over grounded actions and adapter-
+  provided world responses. Continue branches remain leaves unless the adapter
+  explicitly supplies a continuation action hook.
   It evaluates optionality, risk floor, and expected path quality.
 
 ## Important Dimensions
@@ -140,24 +144,29 @@ The canonical public entry point is `CognitiveAgent.act` in `agent.py`.
 1. `CandidateInterventionGenerator` reads actor/counterpart situations,
    relation edge, and context to generate latent action vectors.
 2. The adapter decodes each latent action into a `GroundedAction`.
-3. `adapter.encode_action_signal(action, context)` creates `s` for each
-   grounded action.
-4. `CognitiveAgent` builds `r_dict` from each `RuleInterpretation.r_j`.
-5. `CognitiveAgent` builds `sigma_dict` via `sigma_of(j)`.
-6. `InterpretationEngine.compute_Z` computes every observer row of `Z`.
-7. `InterpretationEngine.propagate` computes B-to-C re-signalling as `z_C`.
-8. `SignalGenerator` emits a learned outgoing communicative signal for the
+3. `adapter.encode_observation(snapshot, viewer)` creates an observation, and
+   `CognitiveAgent.update_belief` builds observation-derived `BeliefState`
+   without assuming any action.
+4. `adapter.encode_action_signal(action, context)` creates `s` only once a
+   candidate action is being interpreted.
+5. `CognitiveAgent` builds `r_dict` from each `RuleInterpretation.r_j`.
+6. `CognitiveAgent` builds `sigma_dict` via `sigma_of(j)`.
+7. `InterpretationEngine.compute_Z` computes every observer row of `Z`.
+8. `InterpretationEngine.propagate` computes B-to-C re-signalling as `z_C`.
+9. `SignalGenerator` emits a learned outgoing communicative signal for the
    candidate intervention.
-9. `FutureTreeGen.simulate_action` asks the adapter for response labels and
-   transitions, then reconstructs `T(intervention, signal)` from `Z`.
-10. `FutureTreeGen.apply_path_dep` reweights root branches from recent history
+10. `CounterfactualPlanner` asks the adapter for world-response labels and
+   transitions, then reconstructs `T(intervention, signal)` from `Z` and the
+   current `RuntimeSnapshot`.
+11. `FutureTreeGen.apply_path_dep` reweights root branches from recent history
    and scales descendant joint probabilities consistently.
-11. `FutureTreeGen.evaluate` returns differentiable metrics:
+12. `FutureTreeGen.evaluate` returns differentiable metrics:
    `optionality`, `risk_floor`, and `path_quality`.
-12. `DecisionEngine` scores predicted futures and chooses an action/signal.
-13. `experience.py` resolves the observed outcome, evaluates realized utility,
-    and separates prediction, value, and policy losses.
-14. Training currently combines:
+13. `DecisionEngine` scores predicted futures and chooses an action/signal.
+14. `transition_event -> outcome_from_transition` resolves the observed
+    outcome, evaluates realized utility, and separates prediction, value, and
+    policy losses through a trajectory.
+15. Training currently combines:
 
 ```text
 loss = dissonance + 0.01 * rule_reg + experience.learning_signal.total_loss
@@ -197,12 +206,11 @@ z_j = tanh(W_z [s || G[j,i,:] || r_j || sigma_j])
 over the adapter-provided response labels. It no longer has a fixed output
 size of three in the core layer.
 
-`FutureTreeGen.simulate_action` builds a future tree conditioned on one
-candidate intervention. Response labels, transition rules, continue-branch
-semantics, and outcome quality come from the adapter.
-`FutureTreeGen.generate` remains as the legacy helper that expands all adapter
-candidates under one root. `evaluate` normalizes leaf probability mass before
-computing tree metrics.
+`CounterfactualPlanner.simulate` builds a future tree conditioned on one
+candidate intervention and the current runtime snapshot. World-response labels,
+transition rules, continue-branch semantics, and outcome quality come from the
+adapter. `evaluate` normalizes leaf probability mass before computing tree
+metrics.
 
 ### `game_spec.py` / `generic_adapter.py`
 
@@ -215,12 +223,6 @@ and effects such as `AddPayoff`, `SetState`, `ScaleState`, and `SetTerminal`.
 `GenericGameAdapter` interprets a `GameSpec` and exposes the stable adapter
 contract consumed by the agent. It handles latent-action decoding for
 continuous, binary, and categorical controls.
-
-### `game_adapter.py`
-
-`UltimatumGameAdapter` is now only a backward-compatible wrapper around the
-declarative Ultimatum spec. New games should be added under `specs/` and run
-through `GenericGameAdapter`, not by creating another handwritten adapter.
 
 ### `action_model.py`
 
@@ -249,9 +251,10 @@ history by EMA:
 h_j <- gamma * h_j + (1 - gamma) * tanh(W_enc(...))
 ```
 
-`omega[0]` stores physical payoff/resource. The remaining resource coordinates
-are initialized as small noise. `update_resource` exists as a helper; the demo
-does not automatically commit payoff deltas into `omega`.
+`omega[0]` stores the role's scalar payoff/resource channel. The remaining
+resource coordinates are initialized as small noise. `update_resource` exists
+as a helper; trajectory learning commits every role listed in
+`Outcome.entity_payoffs`.
 
 ### `agent.py`
 
@@ -276,11 +279,11 @@ When adding model components, prefer registering them here as modules or
 buffers so optimizer behavior and device movement stay predictable.
 
 `generate_candidate_interventions(...)` creates latent actions and adapter-
-decoded interventions. `interpret_and_plan(action, ...)` generates an outgoing
-signal and simulates the future conditioned on that action/signal pair.
-`deliberate(...)` evaluates generated or supplied candidate interventions,
-scores their predicted futures, and returns the selected action plus signal.
-The public loop is `act(...) -> observe(response) -> learn(outcome)`.
+decoded interventions. `deliberate(snapshot, ...)` evaluates generated or
+supplied candidate interventions, scores their predicted futures, and stores
+the selected decision. `act(snapshot, ...)` returns an `ActionEvent`. The public
+runtime loop is `observe(snapshot) -> deliberate(snapshot) -> act(snapshot) ->
+transition_event(ActionEvent, WorldResponse) -> learn(Trajectory)`.
 
 ### `decision.py`
 
@@ -386,10 +389,10 @@ The active architecture goal is broader than this baseline. See
 `docs/first-principles-ai-architecture.md` for the target design. Current
 implemented slices: the agent can generate latent actions, ground them through
 `GenericGameAdapter`, generate learned outgoing signals, simulate candidate
-action/signal interventions, score predicted futures, choose its own
-intervention, resolve a raw observed outcome, evaluate realized utility, expose
-`act/observe/learn`, and separate response-prediction, value, and policy
-losses. The repo includes six declarative benchmark specs. The broader goal
-remains active: richer experience-driven value/preference learning and stronger
-multi-scenario tests for understanding-as-action improvement still need to be
-added.
+action/signal interventions from a `RuntimeSnapshot`, score predicted futures,
+choose its own `ActionEvent`, resolve a raw observed outcome from a
+`WorldResponse`, evaluate realized utility, learn from a `Trajectory`, and
+separate response-prediction, value, and policy losses. The repo includes six
+declarative benchmark specs. The broader goal remains active: richer
+experience-driven value/preference learning and stronger multi-scenario tests
+for understanding-as-action improvement still need to be added.

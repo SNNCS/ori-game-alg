@@ -5,6 +5,8 @@ import torch
 import config
 from agent import CognitiveAgent
 from interpretation import build_context
+from runtime import WorldResponse
+from trajectory import Trajectory
 
 
 def grad_norm(module):
@@ -21,21 +23,25 @@ class ClosedLoopRegressionTests(unittest.TestCase):
     def test_public_act_observe_learn_loop_updates_detached_episode_state(self):
         agent = CognitiveAgent()
         context = build_context(turn_idx=0, session_len=8)
+        snapshot = agent.runtime_snapshot()
 
-        acted = agent.act(context=context)
-        decision = acted["decision"]
+        action_event = agent.act(snapshot=snapshot, context=context)
+        decision = agent._last_decision
 
         self.assertEqual(decision.selected.signal.vector.shape, (config.SIGNAL_DIM,))
         self.assertEqual(decision.selected.latent_action.shape, (config.ACTION_LATENT_DIM,))
 
-        response = agent.adapter.response_labels()[0]
-        outcome = agent.observe(response, decision=decision)
-        experience = agent.learn(outcome, decision=decision)
+        response = WorldResponse(agent.adapter.response_labels()[0])
+        transition = agent.transition_runtime(snapshot, action_event, response)
+        step = agent.build_trajectory_step(decision, action_event, transition)
+        signal = agent.learn(Trajectory((step,), transition.terminal_outcome))
+        experience = agent._last_experience
+        outcome = experience.outcome
 
         self.assertEqual(len(agent.observed_history), 1)
-        self.assertEqual(experience.outcome.response, response)
+        self.assertEqual(experience.outcome.world_response.label, response.label)
         self.assertTrue(torch.isfinite(experience.realized_utility.value))
-        self.assertTrue(torch.isfinite(experience.learning_signal.total_loss))
+        self.assertTrue(torch.isfinite(signal.total_loss))
 
         for h_j in agent.h:
             self.assertFalse(h_j.requires_grad)
@@ -56,19 +62,22 @@ class ClosedLoopRegressionTests(unittest.TestCase):
             status_gap=0.1,
         )
 
-        acted = agent.act(context=context)
-        decision = acted["decision"]
+        snapshot = agent.runtime_snapshot()
+        action_event = agent.act(snapshot=snapshot, context=context)
+        decision = agent._last_decision
         future = decision.selected_future
         root_probs = torch.stack([child.prob for child in future.tree.children]).detach()
-        response = agent.adapter.response_labels()[int(torch.argmax(root_probs))]
+        response = WorldResponse(
+            agent.adapter.response_labels()[int(torch.argmax(root_probs))])
 
-        outcome = agent.observe(response, decision=decision)
-        experience = agent.learn(outcome, decision=decision)
+        transition = agent.transition_runtime(snapshot, action_event, response)
+        step = agent.build_trajectory_step(decision, action_event, transition)
+        learning_signal = agent.learn(Trajectory((step,), transition.terminal_outcome))
 
         loss = (
             agent.dissonance(future.signal_vec, future.Z)
             + 0.01 * agent.rule_reg()
-            + experience.learning_signal.total_loss
+            + learning_signal.total_loss
         )
 
         agent.zero_grad(set_to_none=True)
@@ -94,7 +103,8 @@ class ClosedLoopRegressionTests(unittest.TestCase):
             status_gap=0.1,
         )
 
-        report = agent.probe_understanding_usefulness(context=context)
+        report = agent.probe_understanding_usefulness(
+            context=context, snapshot=agent.runtime_snapshot())
 
         self.assertGreater(abs(float(report.utility_delta)), 1e-6)
         self.assertGreater(float(report.score_delta_norm), 1e-6)

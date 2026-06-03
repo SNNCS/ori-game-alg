@@ -346,3 +346,4 @@ class GameSpec:
     initial_knowledge: Sequence[float] = ()
     r_public_first: float = 0.5
     quality_expr: Expr | None = None
+    schema_version: str = "1"

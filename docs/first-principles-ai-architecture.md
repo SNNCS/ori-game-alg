@@ -8,7 +8,7 @@ Ultimatum-Game codebase.
 ## Status
 
 Draft design with the first implementation slice in place. The current code now
-has `FutureTreeGen.simulate_action`, `decision.py`, and
+has `CounterfactualPlanner`, `decision.py`, and
 `CognitiveAgent.deliberate`, so the agent can score candidate interventions and
 choose its own bid. `action_model.py` now adds learned latent action generation:
 the agent proposes action vectors and the adapter decodes them into executable
@@ -16,15 +16,26 @@ interventions. It also has `experience.py`, `Outcome`,
 `OutcomeUtilityEvaluator`, and `LearningSignal`, so raw observed outcomes,
 realized utility, and prediction/value/policy losses are distinct in code.
 `signal_model.py` now adds learned outgoing communicative signals, and
-`FutureTreeGen` conditions response prediction on those signals.
+`FutureTreeGen` conditions world-response prediction on those signals.
 `game_spec.py` and `generic_adapter.py` now provide the preferred scenario
 extension path: games are declared as Python dataclass specs, then interpreted
 by `GenericGameAdapter`. The repo includes six built-in specs: Ultimatum,
 Prisoner's Dilemma, Chicken, Stag Hunt, Public Goods, and First-price Auction.
-The broader closed loop is not complete yet: richer experience-driven
-value/preference learning, richer multi-dimensional action grounding, and
-stronger multi-scenario tests for understanding-as-action improvement still
-need to be added.
+The broader closed loop is now typed end to end for compact declarative specs:
+observations produce belief state, candidate actions are interpreted into
+intent, world responses train response prediction, and trajectories build
+role-relative return targets. Full external simulators and learned joint-policy
+rollouts remain extension points rather than hard-coded core behavior.
+
+The runtime-contract slice is now also in place. `runtime.py` defines
+`RuntimeSnapshot`, `Observation`, `ActionEvent`, `WorldResponse`,
+`TransitionResult`, `TerminalOutcome`, and schema compatibility metadata.
+`GenericGameAdapter` exposes wrappers for observation encoding, action-event
+grounding, typed world-response transitions, and runtime schema checks.
+`belief.py` adds explicit
+`BeliefState`, and `trajectory.py` adds trajectory-level learning contracts so
+single-step experience is now the length-one case of a broader trajectory
+interface.
 
 ## Core Claim
 
@@ -146,8 +157,8 @@ It must not:
 - Convert outcomes directly into utility.
 
 For the current repo, `GameSpec` plus `GenericGameAdapter` is this boundary.
-`UltimatumGameAdapter` remains only as a backward-compatible wrapper around the
-Ultimatum spec.
+The default Ultimatum environment is constructed directly through
+`GenericGameAdapter(build_ultimatum_spec())`.
 
 ### 2. Belief Model
 
@@ -415,7 +426,8 @@ Observation:
   raw event seen by the agent
 
 BeliefState:
-  internal model after update
+  observation-derived internal model; action-conditioned Z is added only when
+  interpreting a concrete candidate action
 
 CandidateIntervention:
   latent action, adapter-decoded physical/game action, optional signal
@@ -433,16 +445,34 @@ LearningSignal:
   prediction error, value error, and policy credit assignment
 ```
 
+Current implementation note:
+
+```text
+ActionEvent:
+  what the focal actor did
+
+WorldResponse:
+  what the environment or other agents did after that action
+
+Trajectory:
+  ordered ActionEvent / WorldResponse / TransitionResult steps
+```
+
+Prediction targets should be `WorldResponse` objects. Passing an
+`ActionEvent` or a raw response label as a response-prediction target is a type
+error.
+
 ## Migration Plan From Current Code
 
 ### Step 1: Split "simulate one action" from "enumerate all actions"
 
 Status: implemented.
 
-Refactor `FutureTreeGen` so it can build a future tree for one candidate bid:
+Refactor `FutureTreeGen` so the counterfactual planner can build a future tree
+for one candidate action event:
 
 ```text
-simulate_action(Z, action, depth) -> FutureTree
+CounterfactualPlanner.simulate(belief_state, action_event, snapshot) -> FutureTree
 ```
 
 Keep a separate helper for enumerating all legal candidates. This makes the
@@ -455,7 +485,7 @@ Status: implemented as an initial utility-scored selector in `decision.py`.
 Create a module that:
 
 1. receives generated or supplied candidate interventions;
-2. calls `FutureTreeGen.simulate_action` for each candidate;
+2. calls `CounterfactualPlanner.simulate` for each candidate;
 3. evaluates each tree;
 4. returns a selected action plus diagnostics.
 
@@ -482,8 +512,9 @@ message categories.
 
 ### Step 5: Add an experience loop
 
-Status: implemented as an initial public loop. The demo now performs
-`act -> observe -> learn`, and `learn` builds and commits an `ExperienceStep`.
+Status: implemented as a typed runtime loop. The demo now performs
+`runtime_snapshot -> act -> transition_event -> trajectory -> learn`, and
+`learn` commits trajectory-derived experience.
 
 The agent should expose:
 
@@ -494,8 +525,9 @@ act()
 learn(outcome)
 ```
 
-`interpret_and_plan` remains as a lower-level call, while the public interface
-represents the full closed loop.
+Runtime observation, belief update, and counterfactual planning now represent
+the full closed loop; the old single-action `interpret_and_plan` entrypoint has
+been removed.
 
 ### Step 6: Train understanding by action improvement
 

@@ -12,7 +12,7 @@ predictions against observed outcomes and realized utility.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -46,6 +46,7 @@ class PredictedFuture:
     signal_vec: torch.Tensor
     Z: torch.Tensor
     z_C: torch.Tensor
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -57,8 +58,10 @@ class DecisionResult:
     futures: Sequence[PredictedFuture]
     scores: torch.Tensor
     action_probs: torch.Tensor
+    log_action_probs: torch.Tensor
     expected_utility: torch.Tensor
     selected_index: int
+    legal_mask: torch.Tensor | None = None
 
 
 class FuturePositionEvaluator(nn.Module):
@@ -92,21 +95,34 @@ class DecisionEngine(nn.Module):
         super().__init__()
         self.temperature = float(temperature)
 
-    def forward(self, futures, utility_model):
+    def forward(self, futures, utility_model, legal_mask=None):
         if not futures:
             raise ValueError("DecisionEngine requires at least one future.")
 
         scores = torch.stack([utility_model(f.metrics) for f in futures])
+        if legal_mask is None:
+            mask = torch.ones_like(scores, dtype=torch.bool)
+        else:
+            mask = torch.as_tensor(
+                legal_mask, device=scores.device, dtype=torch.bool)
+            if mask.numel() != scores.numel():
+                raise ValueError((mask.shape, scores.shape))
+            if not bool(mask.any().detach().cpu()):
+                raise ValueError("DecisionEngine requires one legal future.")
         temp = max(self.temperature, 1e-6)
-        action_probs = F.softmax(scores / temp, dim=0)
+        masked_scores = scores.masked_fill(~mask, -1e9)
+        log_action_probs = F.log_softmax(masked_scores / temp, dim=0)
+        action_probs = torch.exp(log_action_probs)
         expected_utility = (action_probs * scores).sum()
-        selected_index = int(torch.argmax(scores.detach()).item())
+        selected_index = int(torch.argmax(masked_scores.detach()).item())
         return DecisionResult(
             selected=futures[selected_index].candidate,
             selected_future=futures[selected_index],
             futures=tuple(futures),
             scores=scores,
             action_probs=action_probs,
+            log_action_probs=log_action_probs,
             expected_utility=expected_utility,
             selected_index=selected_index,
+            legal_mask=mask,
         )

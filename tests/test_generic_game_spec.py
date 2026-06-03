@@ -24,8 +24,9 @@ class GenericGameSpecTests(unittest.TestCase):
             with self.subTest(spec=spec.name):
                 adapter = GenericGameAdapter(spec)
                 agent = CognitiveAgent(adapter=adapter)
-                out = agent.act(context=context)
-                decision = out["decision"]
+                snapshot = agent.runtime_snapshot()
+                agent.act(snapshot=snapshot, context=context)
+                decision = agent._last_decision
 
                 self.assertIsInstance(decision.selected.action, GroundedAction)
                 self.assertEqual(
@@ -102,11 +103,13 @@ class GenericGameSpecTests(unittest.TestCase):
         adapter = GenericGameAdapter(PUBLIC_GOODS_SPEC)
         agent = CognitiveAgent(adapter=adapter)
 
-        out = agent.act(context=build_context(turn_idx=0, session_len=8))
-        tree = out["decision"].selected_future.tree
+        snapshot = agent.runtime_snapshot()
+        agent.act(snapshot=snapshot, context=build_context(turn_idx=0, session_len=8))
+        decision = agent._last_decision
+        tree = decision.selected_future.tree
 
         self.assertEqual(len(tree.children), len(adapter.response_labels()))
-        self.assertTrue(torch.isfinite(out["decision"].expected_utility))
+        self.assertTrue(torch.isfinite(decision.expected_utility))
 
 
 if __name__ == "__main__":

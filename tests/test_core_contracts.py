@@ -3,10 +3,11 @@ import unittest
 import torch
 
 import config
-from game_adapter import UltimatumGameAdapter
-from game_rule import UltimatumRule
+from generic_adapter import GenericGameAdapter
 from interpretation import build_context, build_signal
 from relation_graph import RelationGraph
+from runtime import WorldResponse
+from specs import ULTIMATUM_SPEC
 
 
 class CoreContractTests(unittest.TestCase):
@@ -57,11 +58,18 @@ class CoreContractTests(unittest.TestCase):
         self.assertGreater(float(edge_grad), 0.0)
 
     def test_ultimatum_adapter_keeps_outcome_and_features_domain_specific(self):
-        adapter = UltimatumGameAdapter(UltimatumRule())
+        adapter = GenericGameAdapter(ULTIMATUM_SPEC)
 
-        outcome = adapter.resolve_outcome(0.7, "accept", pie=1.0)
+        snapshot = adapter.initial_runtime_snapshot()
+        action_event = adapter.ground_action(0.7, snapshot=snapshot)
+        transition = adapter.transition_event(
+            snapshot, action_event, WorldResponse("accept"))
+        outcome = adapter.outcome_from_transition(transition)
         self.assertEqual(outcome.response, "accept")
         self.assertTrue(outcome.terminal)
+        self.assertFalse(hasattr(outcome, "payoff_A"))
+        self.assertFalse(hasattr(outcome, "payoff_B"))
+        self.assertFalse(hasattr(outcome, "pie_after"))
         self.assertAlmostEqual(
             outcome.payoff_for(adapter.focal_actor, adapter=adapter), 0.7
         )

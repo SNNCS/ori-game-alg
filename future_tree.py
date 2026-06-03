@@ -25,12 +25,16 @@ Metrics (v5):
     apply_path_dep-- P(b|H) ∝ P(b) * exp(lambda * consistency(b, H))
 """
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import config
-from game_adapter import UltimatumGameAdapter
+from generic_adapter import GenericGameAdapter
+from runtime import ActionEvent, RuntimeSnapshot, WorldResponse
+from specs.ultimatum import build_ultimatum_spec
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +75,70 @@ class BranchPolicy(nn.Module):
         return F.softmax(logits, dim=-1)
 
 
+@dataclass(frozen=True)
+class WorldResponseDistribution:
+    """Typed distribution for P(WorldResponse | belief, do(action))."""
+
+    labels: tuple[str, ...]
+    probabilities: torch.Tensor
+
+    def responses(self):
+        return tuple(WorldResponse(label=label) for label in self.labels)
+
+
+class WorldResponseModel(nn.Module):
+    """Names the world-response prediction responsibility explicitly."""
+
+    def __init__(self, response_labels):
+        super().__init__()
+        self.response_labels = tuple(response_labels)
+
+    def forward(self, policy, z_B, action_features, tolerance=None,
+                comm_signal=None):
+        probs = policy(
+            z_B, action_features, tolerance=tolerance,
+            comm_signal=comm_signal)
+        return WorldResponseDistribution(
+            labels=self.response_labels,
+            probabilities=probs,
+        )
+
+
+class FutureValueModel(nn.Module):
+    """Evaluate a simulated future through planner metrics."""
+
+    def forward(self, tree_gen, root, role=None, utility_model=None):
+        metrics = tree_gen.evaluate(root, role=role)
+        value = (
+            utility_model(metrics) if utility_model is not None
+            else metrics["path_quality"])
+        return value, metrics
+
+
+class CounterfactualPlanner(nn.Module):
+    """Simulate a candidate intervention from the current runtime snapshot."""
+
+    def __init__(self, tree_gen):
+        super().__init__()
+        self.tree_gen = tree_gen
+
+    def simulate(self, belief_state, action_event, snapshot=None,
+                 depth=config.DEPTH, comm_signal=None):
+        if belief_state.Z is None:
+            raise ValueError(
+                "Counterfactual planning requires action-conditioned belief.")
+        action = (
+            action_event.action if isinstance(action_event, ActionEvent)
+            else action_event)
+        responder = self.tree_gen.adapter.response_actor(
+            snapshot=snapshot,
+            action_event=action_event if isinstance(action_event, ActionEvent) else None,
+        )
+        return self.tree_gen._simulate_action_tree(
+            belief_state.Z, action, depth=depth, comm_signal=comm_signal,
+            snapshot=snapshot, responder=responder)
+
+
 # ---------------------------------------------------------------------------
 # Tree nodes
 # ---------------------------------------------------------------------------
@@ -91,11 +159,13 @@ class Node:
 # ---------------------------------------------------------------------------
 
 class FutureTreeGen(nn.Module):
-    def __init__(self, rule, adapter=None, d=config.D, tolerance_head=None,
+    def __init__(self, rule=None, adapter=None, d=config.D, tolerance_head=None,
                  signal_dim=config.SIGNAL_DIM):
         super().__init__()
-        self.rule = rule
-        self.adapter = adapter if adapter is not None else UltimatumGameAdapter(rule)
+        self.adapter = (
+            adapter if adapter is not None
+            else GenericGameAdapter(build_ultimatum_spec()))
+        self.rule = rule if rule is not None else self.adapter.rule
         self.d = d
         self.tolerance_head = tolerance_head      # optional ToleranceHead
         self.action_feature_dim = int(getattr(
@@ -105,10 +175,10 @@ class FutureTreeGen(nn.Module):
             action_feature_dim=self.action_feature_dim,
             signal_dim=signal_dim,
             use_tolerance=tolerance_head is not None)
-
-    @property
-    def BIDS(self):
-        return self.adapter.candidate_interventions()
+        self.world_response_model = WorldResponseModel(
+            self.adapter.response_labels())
+        self.future_value_model = FutureValueModel()
+        self.counterfactual_planner = CounterfactualPlanner(self)
 
     @property
     def RESPONSES(self):
@@ -122,8 +192,19 @@ class FutureTreeGen(nn.Module):
             tol = self.tolerance_head(z_B)
         action_features = self.adapter.branch_action_features(
             action, device=z_B.device, dtype=z_B.dtype)
-        return self.policy(
-            z_B, action_features, tolerance=tol, comm_signal=comm_signal)
+        return self.world_response_model(
+            self.policy, z_B, action_features, tolerance=tol,
+            comm_signal=comm_signal).probabilities
+
+    def predict_world_responses(self, z_B, action, comm_signal=None):
+        tol = None
+        if self.tolerance_head is not None:
+            tol = self.tolerance_head(z_B)
+        action_features = self.adapter.branch_action_features(
+            action, device=z_B.device, dtype=z_B.dtype)
+        return self.world_response_model(
+            self.policy, z_B, action_features, tolerance=tol,
+            comm_signal=comm_signal)
 
     # ----- transition ------------------------------------------------------
 
@@ -132,42 +213,56 @@ class FutureTreeGen(nn.Module):
 
     # ----- intent drift across depth --------------------------------------
 
-    def update_Z(self, Z, response):
+    def update_Z(self, Z, response, responder=None):
         """Small whole-row perturbation of the responder's intent across a
         continue branch (v5 update_Z). No slicing -- the entire z_B row drifts.
         """
         Z2 = Z.clone()
         shift = self.adapter.intent_shift_for_response(response)
-        row = self.adapter.counterpart_actor
+        row = (
+            self.adapter.counterpart_actor
+            if responder is None else int(responder))
         Z2[row, :] = torch.tanh(Z2[row, :] + shift)
         return Z2
 
     # ----- tree construction ----------------------------------------------
 
-    def _initial_state(self, sigma_root=None):
+    def _initial_state(self, sigma_root=None, snapshot=None):
+        if snapshot is not None:
+            if not isinstance(snapshot, RuntimeSnapshot):
+                snapshot = RuntimeSnapshot(state=snapshot)
+            if hasattr(self.adapter, "_state_for_ctx"):
+                state = self.adapter._state_for_ctx(snapshot.state)
+            else:
+                state = dict(snapshot.state)
+                state["payoffs"] = dict(state.get("payoffs", {}))
+            state["sigma"] = sigma_root
+            return state
         return self.adapter.initial_tree_state(sigma_root)
 
-    def generate(self, Z, sigma_root=None, depth=config.DEPTH):
-        root_state = self._initial_state(sigma_root)
-        return self._build(Z, root_state, depth, path_prob=None)
-
-    def simulate_action(self, Z, action, sigma_root=None, depth=config.DEPTH,
-                        comm_signal=None):
+    def _simulate_action_tree(self, Z, action, sigma_root=None,
+                              depth=config.DEPTH, comm_signal=None,
+                              snapshot=None, responder=None):
         """Build T(action): a future tree conditioned on one intervention.
 
-        `generate` keeps the legacy "enumerate all bids under the root" shape.
-        This method is the planner primitive needed by a decision engine:
-        it answers "if I do this action now, what futures are possible?"
+        This is the planner primitive needed by a decision engine: it answers
+        "if I do this action from this snapshot, what world responses and
+        terminal/continuation states are possible?"
         """
-        root_state = self._initial_state(sigma_root)
+        root_state = self._initial_state(sigma_root, snapshot=snapshot)
+        if responder is None:
+            responder = self.adapter.response_actor(snapshot=snapshot)
         return self._build_action(
             Z, root_state, action, depth, path_prob=None,
-            comm_signal=comm_signal)
+            comm_signal=comm_signal, responder=responder)
 
     def _build_action(self, Z, state, action, depth, path_prob,
-                      comm_signal=None):
+                      comm_signal=None, responder=None):
         root = Node(state, prob=path_prob)
-        z_B = Z[self.adapter.counterpart_actor]
+        responder = (
+            self.adapter.counterpart_actor
+            if responder is None else int(responder))
+        z_B = Z[responder]
         probs = self._branch_probs(z_B, action, comm_signal=comm_signal)
         for ri, resp in enumerate(self.RESPONSES):
             p = probs[ri]
@@ -176,27 +271,41 @@ class FutureTreeGen(nn.Module):
             child = Node(new_state, action=action, response=resp, prob=joint)
             root.children.append(child)
             if depth > 1 and self.adapter.is_continue_response(resp):
-                new_Z = self.update_Z(Z, resp)
-                sub = self._build(new_Z, new_state, depth - 1, joint)
+                next_action = self.adapter.continuation_action(
+                    new_state, action, resp)
+                if next_action is None:
+                    continue
+                new_Z = self.update_Z(Z, resp, responder=responder)
+                sub = self._build_continue(
+                    new_Z, new_state, next_action, depth - 1, joint,
+                    comm_signal=comm_signal, responder=responder)
                 child.children = sub.children
         return root
 
-    def _build(self, Z, state, depth, path_prob):
+    def _build_continue(self, Z, state, action, depth, path_prob,
+                        comm_signal=None, responder=None):
         root = Node(state, prob=path_prob)
-        z_B = Z[self.adapter.counterpart_actor]
-        n_bids = len(self.BIDS)
-        for bid in self.BIDS:
-            probs = self._branch_probs(z_B, bid)
-            for ri, resp in enumerate(self.RESPONSES):
-                p = probs[ri] / n_bids                     # uniform prior over bids
-                joint = p if path_prob is None else path_prob * p
-                new_state = self.transition(state, bid, resp)
-                child = Node(new_state, action=bid, response=resp, prob=joint)
-                root.children.append(child)
-                if depth > 1 and self.adapter.is_continue_response(resp):
-                    new_Z = self.update_Z(Z, resp)
-                    sub = self._build(new_Z, new_state, depth - 1, joint)
-                    child.children = sub.children
+        responder = (
+            self.adapter.counterpart_actor
+            if responder is None else int(responder))
+        z_B = Z[responder]
+        probs = self._branch_probs(z_B, action, comm_signal=comm_signal)
+        for ri, resp in enumerate(self.RESPONSES):
+            p = probs[ri]
+            joint = path_prob * p
+            new_state = self.transition(state, action, resp)
+            child = Node(new_state, action=action, response=resp, prob=joint)
+            root.children.append(child)
+            if depth > 1 and self.adapter.is_continue_response(resp):
+                next_action = self.adapter.continuation_action(
+                    new_state, action, resp)
+                if next_action is None:
+                    continue
+                new_Z = self.update_Z(Z, resp, responder=responder)
+                sub = self._build_continue(
+                    new_Z, new_state, next_action, depth - 1, joint,
+                    comm_signal=comm_signal, responder=responder)
+                child.children = sub.children
         return root
 
     # ----- evaluation ------------------------------------------------------
